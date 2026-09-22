@@ -1,0 +1,17 @@
+{
+  "host": "127.0.0.1",
+  "port": 8787,
+  "evrenBaseUrl": "https://evren-llmapi.ssyz.org.tr/v1",
+  "model": "deepseek-v4-flash",
+  "toolTransport": "native",
+  "maxSessionTokens": 400000,
+  "maxDailyTokens": 10000000,
+  "maxRequestsPerSession": 20,
+  "maxToolCallsPerSession": 40,
+  "maxEstimatedInputTokensPerCall": 80000,
+  "maxOutputTokensPerCall": 4096,
+  "sessionTtlMinutes": 30,
+  "toolOutputMaxChars": 50000,
+  "pricingRefreshMinutes": 10,
+  "requestTimeoutMs": 120000
+}

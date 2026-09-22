@@ -1,0 +1,41 @@
+export interface ModelPricing {
+  promptTokenPrice: number;
+  completionTokenPrice: number;
+  currency: string;
+}
+
+export type PricingEvaluation =
+  | { allowed: true; pricing: ModelPricing }
+  | { allowed: false; reason: string; pricing?: ModelPricing };
+
+export function evaluateModelPricing(payload: unknown, model: string): PricingEvaluation {
+  if (!payload || typeof payload !== "object") return { allowed: false, reason: "Pricing response is not an object." };
+  const data = (payload as { data?: unknown }).data;
+  if (!Array.isArray(data)) return { allowed: false, reason: "Pricing response is missing the data array." };
+  const entry = data.find(
+    (candidate) => candidate && typeof candidate === "object" && (candidate as { id?: unknown }).id === model,
+  ) as { pricing?: unknown } | undefined;
+  if (!entry) return { allowed: false, reason: `Model ${model} was not found in the EVREN catalog.` };
+  if (!entry.pricing || typeof entry.pricing !== "object") {
+    return { allowed: false, reason: `Pricing metadata is missing for ${model}.` };
+  }
+  const raw = entry.pricing as Record<string, unknown>;
+  if (
+    typeof raw.prompt_token_price !== "number" ||
+    !Number.isFinite(raw.prompt_token_price) ||
+    typeof raw.completion_token_price !== "number" ||
+    !Number.isFinite(raw.completion_token_price) ||
+    typeof raw.currency !== "string"
+  ) {
+    return { allowed: false, reason: `Pricing metadata is invalid for ${model}.` };
+  }
+  const pricing: ModelPricing = {
+    promptTokenPrice: raw.prompt_token_price,
+    completionTokenPrice: raw.completion_token_price,
+    currency: raw.currency,
+  };
+  if (pricing.promptTokenPrice !== 0 || pricing.completionTokenPrice !== 0 || pricing.currency !== "CR") {
+    return { allowed: false, reason: `Pricing is not exactly 0 CR for ${model}.`, pricing };
+  }
+  return { allowed: true, pricing };
+}

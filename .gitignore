@@ -1,0 +1,43 @@
+# Dependencies and generated output
+node_modules/
+dist/
+build/
+coverage/
+.cache/
+.turbo/
+
+# Secrets: keep only the documented placeholder template
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime state and logs: retain only tracked directory markers
+data/*
+!data/.gitkeep
+logs/*
+!logs/.gitkeep
+
+# Temporary files and debug dumps
+*.tsbuildinfo
+*.tmp
+*.temp
+*.bak
+*.log
+*.dump
+*.dmp
+*.trace
+debug/
+dumps/
+
+# IDE and operating-system noise
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini

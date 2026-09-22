@@ -1,0 +1,288 @@
+import { createHash, randomUUID } from "node:crypto";
+import type { NormalizedTool } from "../bridge/tool-protocol.js";
+import type { NativeEvrenInputItem } from "../bridge/native-codex-to-evren.js";
+import type { EvrenUsage } from "../evren/extract-response.js";
+import type { TranscriptEntry } from "./transcript.js";
+
+export interface SessionUsage {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+
+export interface PendingToolCall {
+  callId: string;
+  tool: NormalizedTool;
+  stagedOutput?: string;
+}
+
+export interface CompletedToolCall {
+  callId: string;
+  toolName: string;
+  outputDigest: string;
+}
+
+export interface IncomingToolOutput {
+  callId: string;
+  output: string;
+}
+
+export interface PreparedToolOutputs {
+  active: Array<{
+    callId: string;
+    output: string;
+    pending: PendingToolCall;
+    firstReceipt: boolean;
+  }>;
+  historical: CompletedToolCall[];
+}
+
+export interface Session {
+  id: string;
+  createdAt: Date;
+  lastActivity: Date;
+  requestCount: number;
+  usage: SessionUsage;
+  toolCallCount: number;
+  transcript: TranscriptEntry[];
+  nativeHistory: NativeEvrenInputItem[];
+  responseIds: Set<string>;
+  accountedEvrenResponseIds: Set<string>;
+  pendingToolCalls: Map<string, PendingToolCall>;
+  completedToolCalls: Map<string, CompletedToolCall>;
+  tools: Map<string, NormalizedTool>;
+}
+
+export class UnknownPreviousResponseError extends Error {
+  readonly code = "unknown_previous_response_id";
+}
+
+export class InvalidToolCallSessionError extends Error {
+  readonly code = "invalid_request_error";
+}
+
+export class SessionStore {
+  private readonly sessions = new Map<string, Session>();
+  private readonly responseToSession = new Map<string, string>();
+  private readonly callToSession = new Map<string, string>();
+  private readonly completedCallToSession = new Map<string, string>();
+
+  constructor(
+    private readonly ttlMs: number,
+    private readonly now: () => Date = () => new Date(),
+  ) {}
+
+  resolve(previousResponseId?: string): Session {
+    this.prune();
+    if (previousResponseId) {
+      const sessionId = this.responseToSession.get(previousResponseId);
+      const existing = sessionId ? this.sessions.get(sessionId) : undefined;
+      if (!existing) throw new UnknownPreviousResponseError(`Unknown or expired previous_response_id: ${previousResponseId}`);
+      existing.lastActivity = this.now();
+      return existing;
+    }
+    const now = this.now();
+    const session: Session = {
+      id: `sess_${randomUUID().replaceAll("-", "")}`,
+      createdAt: now,
+      lastActivity: now,
+      requestCount: 0,
+      usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      toolCallCount: 0,
+      transcript: [],
+      nativeHistory: [],
+      responseIds: new Set(),
+      accountedEvrenResponseIds: new Set(),
+      pendingToolCalls: new Map(),
+      completedToolCalls: new Map(),
+      tools: new Map(),
+    };
+    this.sessions.set(session.id, session);
+    return session;
+  }
+
+  recordResponse(session: Session, responseId: string): void {
+    session.responseIds.add(responseId);
+    session.lastActivity = this.now();
+    this.responseToSession.set(responseId, session.id);
+  }
+
+  recordPendingToolCall(session: Session, pending: PendingToolCall): void {
+    const existingSessionId = this.callToSession.get(pending.callId);
+    const completedSessionId = this.completedCallToSession.get(pending.callId);
+    if (existingSessionId || completedSessionId) {
+      throw new Error(`Tool call_id collision: ${pending.callId}`);
+    }
+    session.pendingToolCalls.set(pending.callId, pending);
+    session.lastActivity = this.now();
+    this.callToSession.set(pending.callId, session.id);
+  }
+
+  resolveByToolCallIds(callIds: readonly string[]): Session {
+    this.prune();
+    if (callIds.length === 0) {
+      throw new InvalidToolCallSessionError("Tool output continuation is missing call_id.");
+    }
+
+    let resolved: Session | undefined;
+    const seen = new Set<string>();
+    for (const callId of callIds) {
+      if (seen.has(callId)) {
+        throw new InvalidToolCallSessionError(`Tool output repeats call_id: ${callId}`);
+      }
+      seen.add(callId);
+      const sessionId = this.callToSession.get(callId) ?? this.completedCallToSession.get(callId);
+      const session = sessionId ? this.sessions.get(sessionId) : undefined;
+      if (!session || (!session.pendingToolCalls.has(callId) && !session.completedToolCalls.has(callId))) {
+        throw new InvalidToolCallSessionError(`Tool output references unknown call_id: ${callId}`);
+      }
+      if (resolved && resolved.id !== session.id) {
+        throw new InvalidToolCallSessionError("Tool outputs reference call_ids from different sessions.");
+      }
+      resolved = session;
+    }
+
+    if (!resolved) throw new InvalidToolCallSessionError("Tool output continuation is missing call_id.");
+    resolved.lastActivity = this.now();
+    return resolved;
+  }
+
+  prepareIncomingToolOutputs(session: Session, outputs: readonly IncomingToolOutput[]): PreparedToolOutputs {
+    if (outputs.length === 0) {
+      throw new InvalidToolCallSessionError("Tool output continuation is missing call_id.");
+    }
+
+    const pendingOutputs: Array<{ callId: string; output: string; pending: PendingToolCall }> = [];
+    const historical: CompletedToolCall[] = [];
+    const seen = new Set<string>();
+
+    for (const incoming of outputs) {
+      if (seen.has(incoming.callId)) {
+        throw new InvalidToolCallSessionError(`Tool output repeats call_id: ${incoming.callId}`);
+      }
+      seen.add(incoming.callId);
+
+      const pendingSessionId = this.callToSession.get(incoming.callId);
+      const completedSessionId = this.completedCallToSession.get(incoming.callId);
+      if (pendingSessionId !== undefined) {
+        if (pendingSessionId !== session.id) {
+          throw new InvalidToolCallSessionError("Tool outputs reference call_ids from different sessions.");
+        }
+        const pending = this.validatePendingToolOutput(session, incoming.callId, incoming.output);
+        pendingOutputs.push({ ...incoming, pending });
+        continue;
+      }
+      if (completedSessionId !== undefined) {
+        if (completedSessionId !== session.id) {
+          throw new InvalidToolCallSessionError("Tool outputs reference call_ids from different sessions.");
+        }
+        const completed = session.completedToolCalls.get(incoming.callId);
+        if (!completed) {
+          throw new InvalidToolCallSessionError(`Tool output references unknown call_id: ${incoming.callId}`);
+        }
+        if (completed.outputDigest !== digestToolOutput(incoming.output)) {
+          throw new InvalidToolCallSessionError(
+            `Completed tool output changed while replaying call_id: ${incoming.callId}`,
+          );
+        }
+        historical.push(completed);
+        continue;
+      }
+      throw new InvalidToolCallSessionError(`Tool output references unknown call_id: ${incoming.callId}`);
+    }
+
+    if (pendingOutputs.length === 0) {
+      throw new InvalidToolCallSessionError(
+        "Tool output continuation contains only completed historical call_ids.",
+      );
+    }
+    if (pendingOutputs.length > 1) {
+      throw new InvalidToolCallSessionError(
+        `Parallel tool outputs are not supported; received ${pendingOutputs.length} active pending call_ids.`,
+      );
+    }
+
+    const active = pendingOutputs.map(({ callId, output }) => {
+      const { pending, firstReceipt } = this.stagePendingToolOutput(session, callId, output);
+      return { callId, output, pending, firstReceipt };
+    });
+    return { active, historical };
+  }
+
+  validatePendingToolOutput(session: Session, callId: string, output: string): PendingToolCall {
+    const sessionId = this.callToSession.get(callId);
+    const pending = session.pendingToolCalls.get(callId);
+    if (sessionId !== session.id || !pending) {
+      throw new InvalidToolCallSessionError(`Tool output references unknown call_id: ${callId}`);
+    }
+    if (pending.stagedOutput !== undefined && pending.stagedOutput !== output) {
+      throw new InvalidToolCallSessionError(`Tool output changed while retrying call_id: ${callId}`);
+    }
+    return pending;
+  }
+
+  stagePendingToolOutput(session: Session, callId: string, output: string): { pending: PendingToolCall; firstReceipt: boolean } {
+    const pending = this.validatePendingToolOutput(session, callId, output);
+    const firstReceipt = pending.stagedOutput === undefined;
+    if (firstReceipt) pending.stagedOutput = output;
+    session.lastActivity = this.now();
+    return { pending, firstReceipt };
+  }
+
+  completePendingToolCall(session: Session, callId: string): CompletedToolCall | undefined {
+    const sessionId = this.callToSession.get(callId);
+    const pending = session.pendingToolCalls.get(callId);
+    if (sessionId !== session.id || !pending) return undefined;
+    if (pending.stagedOutput === undefined) {
+      throw new Error(`Cannot complete unstaged tool call: ${callId}`);
+    }
+    const completed: CompletedToolCall = {
+      callId,
+      toolName: pending.tool.name,
+      outputDigest: digestToolOutput(pending.stagedOutput),
+    };
+    session.pendingToolCalls.delete(callId);
+    this.callToSession.delete(callId);
+    session.completedToolCalls.set(callId, completed);
+    this.completedCallToSession.set(callId, session.id);
+    session.lastActivity = this.now();
+    return completed;
+  }
+
+  recordUsage(session: Session, evrenResponseId: string, usage: EvrenUsage): boolean {
+    if (session.accountedEvrenResponseIds.has(evrenResponseId)) return false;
+    session.accountedEvrenResponseIds.add(evrenResponseId);
+    session.usage.inputTokens += usage.inputTokens;
+    session.usage.outputTokens += usage.outputTokens;
+    session.usage.totalTokens += usage.totalTokens;
+    session.lastActivity = this.now();
+    return true;
+  }
+
+  getLatest(): Session | undefined {
+    return [...this.sessions.values()].sort((a, b) => b.lastActivity.getTime() - a.lastActivity.getTime())[0];
+  }
+
+  getByResponseId(responseId: string): Session | undefined {
+    const sessionId = this.responseToSession.get(responseId);
+    return sessionId ? this.sessions.get(sessionId) : undefined;
+  }
+
+  prune(): number {
+    const cutoff = this.now().getTime() - this.ttlMs;
+    let removed = 0;
+    for (const [id, session] of this.sessions) {
+      if (session.lastActivity.getTime() >= cutoff) continue;
+      for (const responseId of session.responseIds) this.responseToSession.delete(responseId);
+      for (const callId of session.pendingToolCalls.keys()) this.callToSession.delete(callId);
+      for (const callId of session.completedToolCalls.keys()) this.completedCallToSession.delete(callId);
+      this.sessions.delete(id);
+      removed += 1;
+    }
+    return removed;
+  }
+}
+
+function digestToolOutput(output: string): string {
+  return createHash("sha256").update(output, "utf8").digest("hex");
+}
