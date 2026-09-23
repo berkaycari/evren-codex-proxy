@@ -15,15 +15,16 @@ import { SafeLogger } from "../src/ui/logger.js";
 const snapshot: DashboardSnapshot = {
   status: "ONLINE",
   listen: "127.0.0.1:8787",
-  model: "deepseek-v4-flash",
+  model: "deepseek-v4.1-flash",
   transport: "native",
-  version: "1.0.0",
+  version: "1.1.0",
   pricing: {
     allowed: true,
     connected: true,
     checkedAt: "2026-09-21T12:00:00.000Z",
     pricing: { promptTokenPrice: 0, completionTokenPrice: 0, currency: "CR" },
   },
+  credits: { held: 0, remaining: 1_000, uncertain: false },
   daily: {
     date: "2026-09-21",
     inputTokens: 0,
@@ -99,7 +100,7 @@ describe("dashboard", () => {
       .toEqual(["READY", "CODEX", "EVREN", "TOOL", "RESULT", "FINAL"]);
     const lines = buildDashboardLines(snapshot, events, { columns: 72, rows: 24 }, Date.now());
     expect(stripAnsi(lines.join("\n"))).toContain("Current  FINAL");
-    expect(stripAnsi(lines.join("\n"))).toContain("Last FINAL ✓");
+    expect(stripAnsi(lines.join("\n"))).toContain("Last —");
   });
 
   it("shows ERROR as the current and last state", () => {
@@ -111,7 +112,7 @@ describe("dashboard", () => {
     expect(deriveDashboardStage(events)).toBe("ERROR");
     const rendered = stripAnsi(buildDashboardLines(snapshot, events, { columns: 72, rows: 24 }, Date.now()).join("\n"));
     expect(rendered).toContain("Current  ERROR");
-    expect(rendered).toContain("Last ERROR");
+    expect(rendered).toContain("Last —");
   });
 
   it.each(["native", "textual"] as const)("displays %s transport and package version", (transport) => {
@@ -119,7 +120,47 @@ describe("dashboard", () => {
     const rendered = stripAnsi(lines.join("\n"));
 
     expect(rendered).toContain(`Transport ${transport}`);
-    expect(rendered).toContain("v1.0.0");
+    expect(rendered).toContain("EVREN CODEX BRIDGE · v1.1.0");
+  });
+
+  it("shows authoritative last usage, pricing metadata, and trusted credits without inventing price units", () => {
+    const session = {
+      id: "sess_usage",
+      createdAt: new Date(),
+      lastActivity: new Date(),
+      requestCount: 3,
+      inferenceCount: 4,
+      usage: { inputTokens: 40_000, outputTokens: 500, totalTokens: 40_500 },
+      lastUsage: { inputTokens: 20_731, outputTokens: 184, totalTokens: 20_915 },
+      toolCallCount: 2,
+      transcript: [],
+      nativeHistory: [],
+      responseIds: new Set<string>(),
+      accountedEvrenResponseIds: new Set<string>(),
+      pendingToolCalls: new Map(),
+      completedToolCalls: new Map(),
+      tools: new Map(),
+    };
+    const rendered = stripAnsi(buildDashboardLines({
+      ...snapshot,
+      session,
+      pricing: {
+        ...snapshot.pricing,
+        pricing: {
+          promptTokenPrice: 0,
+          completionTokenPrice: 0,
+          currency: "CR",
+          freeUntil: "2026-11-01",
+        },
+      },
+    }, [], { columns: 72, rows: 24 }, Date.now()).join("\n"));
+
+    expect(rendered).toContain("Pricing  prompt 0 · completion 0 CR");
+    expect(rendered).toContain("Free until  2026-11-01");
+    expect(rendered).toContain("Credits Held 0.0000 CR");
+    expect(rendered).toContain("Remaining 1000.0000 CR");
+    expect(rendered).toContain("Last in 20,731 · out 184");
+    expect(rendered).not.toMatch(/CR\s*\/\s*(token|1K|1M)/i);
   });
 
   it("colors a successful EVREN response green without changing visible width", () => {

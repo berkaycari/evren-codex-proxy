@@ -195,6 +195,15 @@ function safeEventDetail(entry: LogEvent, secrets: string[]): string | undefined
         "textual",
         typeof data?.hasUsage === "boolean" ? `usage=${data.hasUsage ? "yes" : "no"}` : undefined,
       ]);
+    case "EVREN_USAGE":
+      return joinDetail([
+        safeInteger(data?.request) === undefined ? undefined : `#${formatNumber(safeInteger(data?.request)!)}`,
+        numberDetail("in", data?.inputTokens),
+        numberDetail("out", data?.outputTokens),
+        numberDetail("bytes", data?.payloadBytes),
+        numberDetail("items", data?.historyItems),
+        numberDetail("tools", data?.toolCount),
+      ]);
     case "NATIVE_TOOL_REQUEST":
     case "TOOL_REQUEST":
       return safeTool(data?.tool, secrets);

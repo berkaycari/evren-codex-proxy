@@ -48,6 +48,23 @@ describe("sessions and usage", () => {
       .toThrow("Tool output references unknown call_id: call_completed_expired");
   });
 
+  it("selects the most recently started foreground session instead of the latest background activity", () => {
+    let now = new Date("2026-09-23T12:00:00.000Z");
+    const store = new SessionStore(60_000, () => now);
+    const main = store.resolve();
+    store.markForeground(main);
+    now = new Date("2026-09-23T12:00:01.000Z");
+    const helper = store.resolve();
+
+    expect(store.getLatest()).toBe(helper);
+    expect(store.getCurrent()).toBe(main);
+
+    now = new Date("2026-09-23T12:00:02.000Z");
+    const realToollessForeground = store.resolve();
+    store.markForeground(realToollessForeground);
+    expect(store.getCurrent()).toBe(realToollessForeground);
+  });
+
   it("persists authoritative EVREN usage atomically and deduplicates response ids", async () => {
     const temp = await mkdtemp(path.join(os.tmpdir(), "evren-usage-"));
     const tracker = new UsageTracker(new UsagePersistence(temp), () => new Date("2026-09-21T12:00:00+03:00"));

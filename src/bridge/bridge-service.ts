@@ -3,8 +3,18 @@ import type { EvrenNativeResult, EvrenTransport } from "../evren/client.js";
 import type { EvrenUsage } from "../evren/extract-response.js";
 import { assertPostUsageAllowed, assertRequestAllowed, assertToolCallAllowed, LimitExceededError } from "../safety/limits.js";
 import type { PricingGuard } from "../safety/pricing-guard.js";
+import {
+  DeterministicRetryCircuit,
+  fingerprintNativeEvrenRequest,
+  RetryCircuitBlockedError,
+} from "../safety/deterministic-retry-circuit.js";
 import { estimateInputTokens } from "../safety/token-estimator.js";
-import type { Session, SessionStore } from "../sessions/store.js";
+import {
+  InvalidToolCallSessionError,
+  type PreparedToolOutputs,
+  type Session,
+  type SessionStore,
+} from "../sessions/store.js";
 import type { UsageTracker } from "../usage/tracker.js";
 import type { EventSink } from "../ui/logger.js";
 import { buildEvrenPrompt, buildRepairPrompt, truncateToolOutput } from "./codex-to-evren.js";
@@ -24,7 +34,25 @@ export interface BridgeResult extends BuiltCodexResponse {
   session: Session;
 }
 
+type ContinuationKind = "new_request" | "previous_response" | "tool_output" | "historical_replay" | "canonical_replay";
+
+interface IncomingClassification {
+  continuation: ContinuationKind;
+  prepared: PreparedToolOutputs;
+  replayedMessageIndexes: Set<number>;
+}
+
+interface InferenceMetrics {
+  requestNumber: number;
+  payloadChars: number;
+  payloadBytes: number;
+  historyItems: number;
+  toolCount: number;
+}
+
 export class BridgeService {
+  private readonly retryCircuit: DeterministicRetryCircuit;
+
   constructor(private readonly deps: {
     config: BridgeConfig;
     client: EvrenTransport;
@@ -32,24 +60,20 @@ export class BridgeService {
     sessions: SessionStore;
     usage: UsageTracker;
     logger: EventSink;
-  }) {}
+    retryCircuit?: DeterministicRetryCircuit;
+  }) {
+    this.retryCircuit = deps.retryCircuit ?? new DeterministicRetryCircuit();
+  }
 
   async handle(body: unknown): Promise<BridgeResult> {
     const request = normalizeCodexRequest(body);
-    const session = request.previousResponseId
-      ? this.deps.sessions.resolve(request.previousResponseId)
-      : request.toolOutputCallIds.length > 0
-        ? this.deps.sessions.resolveByToolCallIds(request.toolOutputCallIds)
-        : this.deps.sessions.resolve();
-    const continuation = request.toolOutputCallIds.length > 0
-      ? "tool_output"
-      : request.previousResponseId
-        ? "previous_response"
-        : "new_request";
+    const resolved = this.resolveSession(request);
+    const session = resolved.session;
+    const classification = this.classifyIncoming(session, request, resolved.canonicalReplay);
 
     let activeToolCallIds: string[] = [];
-    if (continuation === "tool_output") {
-      activeToolCallIds = this.appendIncoming(session, request.entries, continuation);
+    if (classification.continuation === "tool_output") {
+      activeToolCallIds = this.appendIncoming(session, request.entries, classification);
     }
 
     this.deps.usage.assertCertain();
@@ -58,11 +82,11 @@ export class BridgeService {
     request.tools = tools;
     session.tools = new Map(tools.map((tool) => [tool.name, tool]));
 
-    if (continuation !== "tool_output") {
+    if (classification.continuation !== "tool_output") {
       if (this.deps.config.toolTransport === "native" && request.instructions) {
         this.appendNativeInstruction(session, request.instructions);
       }
-      this.appendIncoming(session, request.entries, continuation);
+      this.appendIncoming(session, request.entries, classification);
     }
 
     return this.deps.config.toolTransport === "native"
@@ -82,9 +106,42 @@ export class BridgeService {
       this.deps.config.model,
       this.deps.config.maxOutputTokensPerCall,
     );
-    this.beginRequest(session, tools, JSON.stringify(upstream), request);
-    const result = await this.respondAndAccount(session, upstream);
-    const decision = parseNativeEvrenResponse(result.raw, session.tools);
+    const requestFingerprint = fingerprintNativeEvrenRequest(upstream);
+    try {
+      this.retryCircuit.assertAllowed(requestFingerprint);
+    } catch (error) {
+      if (error instanceof RetryCircuitBlockedError) {
+        this.deps.logger.log({
+          event: "RETRY_CIRCUIT_BLOCKED",
+          level: "warn",
+          message: "Repeated deterministic native protocol failure blocked before EVREN inference.",
+          data: { failureCode: error.failureCode },
+        });
+      }
+      throw error;
+    }
+    const serializedUpstream = JSON.stringify(upstream);
+    this.beginRequest(session, tools, serializedUpstream, request);
+    const metrics = this.startInference(session, serializedUpstream, upstream.input.length, upstream.tools.length);
+    const result = await this.respondAndAccount(session, upstream, metrics);
+    let decision: ReturnType<typeof parseNativeEvrenResponse>;
+    try {
+      decision = parseNativeEvrenResponse(result.raw, session.tools);
+    } catch (error) {
+      if (error instanceof ToolProtocolError) {
+        this.retryCircuit.recordFailure(requestFingerprint, error.code);
+      }
+      throw error;
+    }
+    this.retryCircuit.recordSuccess(requestFingerprint);
+    if (decision.kind === "tool_call" && decision.returnedCallCount > 1) {
+      this.deps.logger.log({
+        event: "NATIVE_MULTI_TOOL_SERIALIZED",
+        level: "warn",
+        message: `${decision.returnedCallCount} calls → serialized to 1`,
+        data: { returnedCallCount: decision.returnedCallCount, selectedTool: decision.name },
+      });
+    }
     if (decision.kind === "tool_call") assertToolCallAllowed(this.deps.config, session);
 
     const modelDecision: ModelDecision = decision.kind === "final"
@@ -141,7 +198,7 @@ export class BridgeService {
     this.beginRequest(session, tools, prompt, request);
     let decision: ModelDecision;
     let aggregate: EvrenUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
-    const first = await this.inferAndAccount(session, prompt);
+    const first = await this.inferAndAccount(session, prompt, tools.length);
     aggregate = addUsage(aggregate, first.usage);
     try {
       decision = parseModelDecision(first.text, session.tools);
@@ -150,7 +207,7 @@ export class BridgeService {
       const repairPrompt = buildRepairPrompt(first.text, error.message, tools);
       this.assertRepairAllowed(session, repairPrompt);
       this.deps.logger.log({ event: "PROTOCOL_REPAIR", level: "warn", message: error.message });
-      const repaired = await this.inferAndAccount(session, repairPrompt);
+      const repaired = await this.inferAndAccount(session, repairPrompt, tools.length);
       aggregate = addUsage(aggregate, repaired.usage);
       decision = parseModelDecision(repaired.text, session.tools);
     }
@@ -190,6 +247,7 @@ export class BridgeService {
     const estimate = assertRequestAllowed(this.deps.config, session, this.deps.usage.snapshot(), estimatedInput);
     session.requestCount += 1;
     session.lastActivity = new Date();
+    if (request.foreground) this.deps.sessions.markForeground(session);
     this.deps.logger.log({
       event: "CODEX_REQUEST",
       data: {
@@ -199,6 +257,8 @@ export class BridgeService {
         toolCount: tools.length,
         inputEstimate: estimate,
         approximate: true,
+        foreground: request.foreground,
+        ...(request.requestKind === undefined ? {} : { requestKind: request.requestKind }),
         unknownFields: request.unknownFields,
       },
     });
@@ -219,18 +279,9 @@ export class BridgeService {
   private appendIncoming(
     session: Session,
     entries: NormalizedCodexRequest["entries"],
-    continuation: "new_request" | "previous_response" | "tool_output",
+    classification: IncomingClassification,
   ): string[] {
-    const replayedMessageIndexes = continuation === "previous_response"
-      ? this.findReplayedMessageIndexes(session, entries)
-      : new Set<number>();
-    const toolEntries = entries.filter((entry) => entry.role === "tool");
-    const prepared = toolEntries.length > 0
-      ? this.deps.sessions.prepareIncomingToolOutputs(session, toolEntries.map((entry) => {
-        if (!entry.callId) throw new InvalidRequestError("Tool output is missing call_id.");
-        return { callId: entry.callId, output: entry.text };
-      }))
-      : { active: [], historical: [] };
+    const { continuation, prepared, replayedMessageIndexes } = classification;
 
     for (const completed of prepared.historical) {
       this.deps.logger.log({
@@ -262,9 +313,8 @@ export class BridgeService {
       }
       if (continuation === "tool_output") continue;
       if (replayedMessageIndexes.has(entryIndex)) continue;
-      if (continuation === "previous_response" && entry.role === "assistant") continue;
-      const last = session.transcript.at(-1);
-      if (last?.role === entry.role && last.text === entry.text) continue;
+      if ((continuation === "previous_response" || continuation === "historical_replay" || continuation === "canonical_replay")
+        && entry.role === "assistant") continue;
       session.transcript.push({ role: entry.role, text: entry.text });
       if (this.deps.config.toolTransport === "native") {
         session.nativeHistory.push(nativeMessage(entry.role, entry.text));
@@ -273,19 +323,118 @@ export class BridgeService {
     return prepared.active.map((active) => active.callId);
   }
 
+  private classifyIncoming(
+    session: Session,
+    request: NormalizedCodexRequest,
+    canonicalReplay: boolean,
+  ): IncomingClassification {
+    const toolEntries = request.entries.filter((entry) => entry.role === "tool");
+    if (toolEntries.length === 0) {
+      const continuation = request.previousResponseId
+        ? "previous_response"
+        : canonicalReplay
+          ? "canonical_replay"
+          : "new_request";
+      const replayedMessageIndexes = continuation === "previous_response" || continuation === "canonical_replay"
+        ? this.findReplayedMessageIndexes(session, request.entries)
+        : new Set<number>();
+      if (continuation === "canonical_replay") {
+        const hasNewUserInput = request.entries.some((entry, index) =>
+          entry.role === "user" && entry.text.trim().length > 0 && !replayedMessageIndexes.has(index),
+        );
+        if (!hasNewUserInput) {
+          throw new InvalidToolCallSessionError("Canonical replay contains no new user message.");
+        }
+      }
+      return {
+        continuation,
+        prepared: { active: [], historical: [] },
+        replayedMessageIndexes,
+      };
+    }
+
+    const prepared = this.deps.sessions.prepareIncomingToolOutputs(session, toolEntries.map((entry) => {
+      if (!entry.callId) throw new InvalidRequestError("Tool output is missing call_id.");
+      return { callId: entry.callId, output: entry.text };
+    }));
+    if (prepared.active.length > 0) {
+      return { continuation: "tool_output", prepared, replayedMessageIndexes: new Set<number>() };
+    }
+
+    const replayedMessageIndexes = this.findReplayedMessageIndexes(session, request.entries);
+    let lastToolIndex = -1;
+    for (const [index, entry] of request.entries.entries()) {
+      if (entry.role === "tool") lastToolIndex = index;
+    }
+    const hasNewUserInput = request.entries.some((entry, index) =>
+      index > lastToolIndex
+      && entry.role === "user"
+      && entry.text.trim().length > 0
+      && !replayedMessageIndexes.has(index),
+    );
+    if (!hasNewUserInput) {
+      throw new InvalidToolCallSessionError(
+        "Tool output continuation contains only completed historical call_ids.",
+      );
+    }
+    return { continuation: "historical_replay", prepared, replayedMessageIndexes };
+  }
+
+  private resolveSession(request: NormalizedCodexRequest): { session: Session; canonicalReplay: boolean } {
+    if (request.previousResponseId) {
+      return { session: this.deps.sessions.resolve(request.previousResponseId), canonicalReplay: false };
+    }
+    if (request.toolOutputCallIds.length > 0) {
+      return {
+        session: this.deps.sessions.resolveByToolCallIds(request.toolOutputCallIds),
+        canonicalReplay: false,
+      };
+    }
+    const replay = this.deps.sessions.resolveByCanonicalReplay(
+      request.entries.flatMap((entry) => entry.role === "tool"
+        ? []
+        : [{ role: entry.role, text: entry.text }]),
+    );
+    return replay
+      ? { session: replay, canonicalReplay: true }
+      : { session: this.deps.sessions.resolve(), canonicalReplay: false };
+  }
+
   private findReplayedMessageIndexes(
     session: Session,
     entries: NormalizedCodexRequest["entries"],
   ): Set<number> {
+    const includesToolOutput = entries.some((entry) => entry.role === "tool");
+    const canonical = session.transcript.filter((entry) => entry.role === "tool" || (
+      (entry.role === "user" || entry.role === "assistant")
+      && entry.callId === undefined
+      && entry.toolName === undefined
+    ));
+    if (includesToolOutput) {
+      let best = new Set<number>();
+      for (let start = 0; start < canonical.length; start += 1) {
+        const candidate = new Set<number>();
+        let matchedTool = false;
+        let matchedCount = 0;
+        for (const [entryIndex, entry] of entries.entries()) {
+          const expected = canonical[start + matchedCount];
+          if (!expected || !replayedEntryMatches(entry, expected)) break;
+          if (entry.role === "tool") matchedTool = true;
+          else candidate.add(entryIndex);
+          matchedCount += 1;
+        }
+        if (matchedTool && candidate.size > best.size) best = candidate;
+      }
+      return best;
+    }
+
     if (!entries.some((entry) => entry.role === "assistant")) return new Set();
-    const canonical = session.transcript.filter((entry) =>
-      (entry.role === "user" || entry.role === "assistant") && entry.callId === undefined && entry.toolName === undefined,
-    );
+    const canonicalMessages = canonical.filter((entry) => entry.role !== "tool");
     const replayed = new Set<number>();
     let canonicalIndex = 0;
     for (const [entryIndex, entry] of entries.entries()) {
       if (entry.role === "tool") break;
-      const expected = canonical[canonicalIndex];
+      const expected = canonicalMessages[canonicalIndex];
       if (!expected || entry.role !== expected.role || entry.text !== expected.text) break;
       replayed.add(entryIndex);
       canonicalIndex += 1;
@@ -310,22 +459,34 @@ export class BridgeService {
     }
   }
 
-  private async inferAndAccount(session: Session, prompt: string): Promise<{ text: string; usage: EvrenUsage }> {
+  private async inferAndAccount(
+    session: Session,
+    prompt: string,
+    toolCount: number,
+  ): Promise<{ text: string; usage: EvrenUsage }> {
     this.deps.pricingGuard.assertAllowed();
     this.deps.usage.assertCertain();
+    const serialized = JSON.stringify({
+      model: this.deps.config.model,
+      input: prompt,
+      max_output_tokens: this.deps.config.maxOutputTokensPerCall,
+      stream: false,
+    });
+    const metrics = this.startInference(session, serialized, session.transcript.length, toolCount);
     const result = await this.deps.client.infer(prompt, this.deps.config.maxOutputTokensPerCall);
-    const usage = await this.accountUsage(session, result.id, result.usage);
+    const usage = await this.accountUsage(session, result.id, result.usage, metrics);
     return { text: result.text, usage };
   }
 
   private async respondAndAccount(
     session: Session,
     request: Parameters<EvrenTransport["respond"]>[0],
+    metrics: InferenceMetrics,
   ): Promise<EvrenNativeResult & { usage: EvrenUsage }> {
     this.deps.pricingGuard.assertAllowed();
     this.deps.usage.assertCertain();
     const result = await this.deps.client.respond(request);
-    const usage = await this.accountUsage(session, result.id, result.usage);
+    const usage = await this.accountUsage(session, result.id, result.usage, metrics);
     return { ...result, usage };
   }
 
@@ -333,6 +494,7 @@ export class BridgeService {
     session: Session,
     responseId: string,
     usage: EvrenUsage | undefined,
+    metrics: InferenceMetrics,
   ): Promise<EvrenUsage> {
     if (!usage) {
       this.deps.usage.markUncertain();
@@ -346,8 +508,37 @@ export class BridgeService {
       this.deps.usage.markUncertain();
       throw error;
     }
+    this.deps.logger.log({
+      event: "EVREN_USAGE",
+      data: {
+        request: metrics.requestNumber,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        totalTokens: usage.totalTokens,
+        payloadChars: metrics.payloadChars,
+        payloadBytes: metrics.payloadBytes,
+        historyItems: metrics.historyItems,
+        toolCount: metrics.toolCount,
+      },
+    });
     assertPostUsageAllowed(this.deps.config, session, this.deps.usage.snapshot());
     return usage;
+  }
+
+  private startInference(
+    session: Session,
+    serializedPayload: string,
+    historyItems: number,
+    toolCount: number,
+  ): InferenceMetrics {
+    session.inferenceCount += 1;
+    return {
+      requestNumber: session.inferenceCount,
+      payloadChars: serializedPayload.length,
+      payloadBytes: Buffer.byteLength(serializedPayload, "utf8"),
+      historyItems,
+      toolCount,
+    };
   }
 
   private assertRepairAllowed(session: Session, prompt: string): void {
@@ -371,6 +562,15 @@ export class BridgeService {
       throw new LimitExceededError("MAX_DAILY_TOKENS", daily.totalTokens, config.maxDailyTokens);
     }
   }
+}
+
+function replayedEntryMatches(
+  entry: NormalizedCodexRequest["entries"][number],
+  canonical: Session["transcript"][number],
+): boolean {
+  if (entry.role !== canonical.role) return false;
+  if (entry.role === "tool") return Boolean(entry.callId) && entry.callId === canonical.callId;
+  return entry.text === canonical.text;
 }
 
 function addUsage(left: EvrenUsage, right: EvrenUsage): EvrenUsage {

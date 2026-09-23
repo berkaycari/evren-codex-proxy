@@ -30,4 +30,40 @@ describe("Codex request normalization", () => {
     expect(request.entries).toEqual([{ role: "user", text: "safe user text" }]);
     expect(JSON.stringify(request)).not.toContain("private chain");
   });
+
+  it("uses only allowlisted Codex turn metadata to classify dashboard foreground requests", () => {
+    const foreground = normalizeCodexRequest({
+      input: "user turn",
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({
+          request_kind: "turn",
+          thread_id: "thread_main",
+          token: "must-not-be-copied",
+        }),
+      },
+    });
+    const helper = normalizeCodexRequest({
+      input: "internal helper",
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({ request_kind: "prewarm", thread_id: "thread_main" }),
+      },
+    });
+
+    expect(foreground).toMatchObject({ requestKind: "turn", foreground: true });
+    expect(helper).toMatchObject({ requestKind: "prewarm", foreground: false });
+    expect(JSON.stringify(foreground)).not.toContain("thread_main");
+    expect(JSON.stringify(foreground)).not.toContain("must-not-be-copied");
+  });
+
+  it("keeps legacy requests foreground while malformed or unknown metadata cannot steal focus", () => {
+    expect(normalizeCodexRequest({ input: "legacy" }).foreground).toBe(true);
+    expect(normalizeCodexRequest({
+      input: "malformed",
+      client_metadata: { "x-codex-turn-metadata": "not json" },
+    }).foreground).toBe(false);
+    expect(normalizeCodexRequest({
+      input: "future helper",
+      client_metadata: { "x-codex-turn-metadata": JSON.stringify({ request_kind: "unknown_internal_kind" }) },
+    }).foreground).toBe(false);
+  });
 });

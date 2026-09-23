@@ -21,7 +21,7 @@ $providerBlock = @(
 )
 $profileContent = @(
     'model_provider = "evren"'
-    'model = "deepseek-v4-flash"'
+    'model = "deepseek-v4.1-flash"'
     ''
 ) -join [Environment]::NewLine
 

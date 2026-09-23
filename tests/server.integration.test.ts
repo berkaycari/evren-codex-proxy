@@ -87,20 +87,20 @@ describe("HTTP server", () => {
     expect(await response.json()).toMatchObject({ status: "online", listen: "127.0.0.1:8787" });
   });
 
-  it("serves safe health and Codex 0.155.1 model catalog responses", async () => {
+  it("serves safe health and Codex 0.156.1 model catalog responses", async () => {
     const { app } = await fixture(['{"kind":"final","content":"ok"}']);
     const health = await app.inject({ method: "GET", url: "/health" });
     expect(health.statusCode).toBe(200);
-    expect(health.json()).toMatchObject({ status: "online", model: "deepseek-v4-flash", evren: "connected" });
+    expect(health.json()).toMatchObject({ status: "online", model: "deepseek-v4.1-flash", evren: "connected" });
     expect(JSON.stringify(health.json())).not.toContain("apiKey");
-    const models = await app.inject({ method: "GET", url: "/v1/models?client_version=0.155.1" });
+    const models = await app.inject({ method: "GET", url: "/v1/models?client_version=0.156.1" });
     expect(models.json()).toEqual({ models: [] });
   });
 
   it("returns a normal Responses API final text response", async () => {
     const { app, usage, events } = await fixture(['{"kind":"final","content":"finished"}']);
     const response = await app.inject({
-      method: "POST", url: "/v1/responses", payload: { model: "deepseek-v4-flash", input: "hello", stream: false },
+      method: "POST", url: "/v1/responses", payload: { model: "deepseek-v4.1-flash", input: "hello", stream: false },
     });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({

@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 const defaults = JSON.parse(
   readFileSync(new URL("../config/defaults.json", import.meta.url), "utf8"),
@@ -36,8 +37,28 @@ const ENV_NUMBERS: Record<string, keyof BridgeConfig> = {
   EVREN_REQUEST_TIMEOUT_MS: "requestTimeoutMs",
 };
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
-  const config = { ...defaults } as BridgeConfig;
+const LOCAL_NUMBER_KEYS = [
+  "maxSessionTokens",
+  "maxDailyTokens",
+  "maxRequestsPerSession",
+  "maxToolCallsPerSession",
+  "maxEstimatedInputTokensPerCall",
+  "maxOutputTokensPerCall",
+  "toolOutputMaxChars",
+  "sessionTtlMinutes",
+  "pricingRefreshMinutes",
+  "requestTimeoutMs",
+] as const satisfies ReadonlyArray<keyof BridgeConfig>;
+
+const localNumberKeys = new Set<string>(LOCAL_NUMBER_KEYS);
+
+export function loadConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  options: { localConfigPath?: string } = {},
+): BridgeConfig {
+  const localConfigPath = options.localConfigPath
+    ?? fileURLToPath(new URL("../config/local.json", import.meta.url));
+  const config = { ...defaults, ...readLocalConfig(localConfigPath) } as BridgeConfig;
   for (const [envName, key] of Object.entries(ENV_NUMBERS)) {
     const raw = env[envName];
     if (raw === undefined) continue;
@@ -59,4 +80,40 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
   config.evrenBaseUrl = defaults.evrenBaseUrl;
   config.model = defaults.model;
   return config;
+}
+
+function readLocalConfig(path: string): Partial<BridgeConfig> {
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return {};
+    throw new Error(`Unable to read local configuration at ${path}.`, { cause: error });
+  }
+
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`Local configuration at ${path} is not valid JSON.`, { cause: error });
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Local configuration at ${path} must be a JSON object.`);
+  }
+
+  const result: Partial<BridgeConfig> = {};
+  for (const [key, raw] of Object.entries(value)) {
+    if (!localNumberKeys.has(key)) {
+      throw new Error(`Unsupported local configuration key: ${key}. Secrets and runtime endpoints are not allowed.`);
+    }
+    if (!Number.isSafeInteger(raw) || (raw as number) <= 0) {
+      throw new Error(`Local configuration value ${key} must be a positive integer.`);
+    }
+    (result as Record<string, number>)[key] = raw as number;
+  }
+  return result;
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
 }

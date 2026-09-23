@@ -8,6 +8,7 @@ import { LimitExceededError } from "../safety/limits.js";
 import { PricingBlockedError } from "../safety/pricing-guard.js";
 import { InvalidToolCallSessionError, UnknownPreviousResponseError } from "../sessions/store.js";
 import { AccountingUncertainError } from "../usage/tracker.js";
+import { RetryCircuitBlockedError } from "../safety/deterministic-retry-circuit.js";
 import type { EventSink } from "../ui/logger.js";
 
 export function registerResponsesRoute(
@@ -65,7 +66,7 @@ function sendError(reply: FastifyReply, error: unknown): FastifyReply {
     type = "upstream_usage_error";
     code = error.code;
     message = error.message;
-  } else if (error instanceof ToolProtocolError) {
+  } else if (error instanceof ToolProtocolError || error instanceof RetryCircuitBlockedError) {
     status = 502;
     type = "upstream_protocol_error";
     code = error.code;

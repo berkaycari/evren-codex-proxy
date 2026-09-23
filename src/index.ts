@@ -53,7 +53,7 @@ async function main(): Promise<void> {
   const pricing = await pricingGuard.refresh();
   pricingGuard.startPeriodic(config.pricingRefreshMinutes);
   const bridge = new BridgeService({ config, client, pricingGuard, sessions, usage, logger });
-  const app = buildServer({ config, pricingGuard, sessions, usage, bridge, logger });
+  const app = buildServer({ config, pricingGuard, sessions, usage, bridge, logger, credits: client });
   const dashboard = new Dashboard(logger);
 
   restoreTerminal = (): void => {
@@ -80,9 +80,10 @@ async function main(): Promise<void> {
   let lastDashboardFingerprint = "";
 
   const render = (): void => {
-    const session = sessions.getLatest();
+    const session = sessions.getCurrent();
     const pricingState = pricingGuard.getState();
     const daily = usage.snapshot();
+    const credits = client.getCreditState();
     const lastAction = logger.getRecent().at(-1)?.event ?? "Waiting for Codex";
 
     const status =
@@ -100,6 +101,7 @@ async function main(): Promise<void> {
         reason: pricingState.reason,
         values: pricingState.pricing,
       },
+      credits,
       session: session
         ? {
           id: session.id,
@@ -134,6 +136,7 @@ async function main(): Promise<void> {
       transport: config.toolTransport,
       version: packageVersion,
       pricing: pricingState,
+      credits,
       ...(session === undefined ? {} : { session }),
       daily,
       limits: {

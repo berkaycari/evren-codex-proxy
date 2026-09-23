@@ -39,22 +39,35 @@ describe("pricing and safety", () => {
 
   it("allows only exact numeric zero CR pricing", () => {
     const result = evaluateModelPricing({ data: [{
-      id: "deepseek-v4-flash",
+      id: "deepseek-v4.1-flash",
       pricing: { prompt_token_price: 0, completion_token_price: 0, currency: "CR" },
-    }] }, "deepseek-v4-flash");
+    }] }, "deepseek-v4.1-flash");
     expect(result.allowed).toBe(true);
+  });
+
+  it("preserves optional free-until visibility without changing the zero-price guard", () => {
+    const result = evaluateModelPricing({ data: [{
+      id: "deepseek-v4.1-flash",
+      pricing: {
+        prompt_token_price: 0,
+        completion_token_price: 0,
+        currency: "CR",
+        free_until: "2026-11-01",
+      },
+    }] }, "deepseek-v4.1-flash");
+    expect(result).toMatchObject({ allowed: true, pricing: { freeUntil: "2026-11-01" } });
   });
 
   it("blocks positive pricing", () => {
     const result = evaluateModelPricing({ data: [{
-      id: "deepseek-v4-flash",
+      id: "deepseek-v4.1-flash",
       pricing: { prompt_token_price: 0.001, completion_token_price: 0, currency: "CR" },
-    }] }, "deepseek-v4-flash");
+    }] }, "deepseek-v4.1-flash");
     expect(result.allowed).toBe(false);
   });
 
   it("blocks missing pricing", () => {
-    expect(evaluateModelPricing({ data: [{ id: "deepseek-v4-flash" }] }, "deepseek-v4-flash").allowed).toBe(false);
+    expect(evaluateModelPricing({ data: [{ id: "deepseek-v4.1-flash" }] }, "deepseek-v4.1-flash").allowed).toBe(false);
   });
 
   it("enforces session and daily token limits", () => {

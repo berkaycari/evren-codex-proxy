@@ -42,7 +42,9 @@ export interface Session {
   createdAt: Date;
   lastActivity: Date;
   requestCount: number;
+  inferenceCount: number;
   usage: SessionUsage;
+  lastUsage?: EvrenUsage;
   toolCallCount: number;
   transcript: TranscriptEntry[];
   nativeHistory: NativeEvrenInputItem[];
@@ -66,6 +68,7 @@ export class SessionStore {
   private readonly responseToSession = new Map<string, string>();
   private readonly callToSession = new Map<string, string>();
   private readonly completedCallToSession = new Map<string, string>();
+  private currentSessionId: string | undefined;
 
   constructor(
     private readonly ttlMs: number,
@@ -87,6 +90,7 @@ export class SessionStore {
       createdAt: now,
       lastActivity: now,
       requestCount: 0,
+      inferenceCount: 0,
       usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
       toolCallCount: 0,
       transcript: [],
@@ -147,6 +151,27 @@ export class SessionStore {
     return resolved;
   }
 
+  resolveByCanonicalReplay(entries: ReadonlyArray<{ role: "user" | "assistant"; text: string }>): Session | undefined {
+    this.prune();
+    if (!entries.some((entry) => entry.role === "assistant")) return undefined;
+
+    const candidates = [...this.sessions.values()].filter((session) => {
+      const canonical = session.transcript.filter((entry) =>
+        (entry.role === "user" || entry.role === "assistant")
+        && entry.callId === undefined
+        && entry.toolName === undefined,
+      );
+      if (canonical.length === 0 || entries.length < canonical.length) return false;
+      return canonical.every((expected, index) => {
+        const incoming = entries[index];
+        return incoming?.role === expected.role && incoming.text === expected.text;
+      });
+    });
+    if (candidates.length !== 1) return undefined;
+    candidates[0]!.lastActivity = this.now();
+    return candidates[0];
+  }
+
   prepareIncomingToolOutputs(session: Session, outputs: readonly IncomingToolOutput[]): PreparedToolOutputs {
     if (outputs.length === 0) {
       throw new InvalidToolCallSessionError("Tool output continuation is missing call_id.");
@@ -191,11 +216,6 @@ export class SessionStore {
       throw new InvalidToolCallSessionError(`Tool output references unknown call_id: ${incoming.callId}`);
     }
 
-    if (pendingOutputs.length === 0) {
-      throw new InvalidToolCallSessionError(
-        "Tool output continuation contains only completed historical call_ids.",
-      );
-    }
     if (pendingOutputs.length > 1) {
       throw new InvalidToolCallSessionError(
         `Parallel tool outputs are not supported; received ${pendingOutputs.length} active pending call_ids.`,
@@ -250,6 +270,7 @@ export class SessionStore {
   }
 
   recordUsage(session: Session, evrenResponseId: string, usage: EvrenUsage): boolean {
+    session.lastUsage = { ...usage };
     if (session.accountedEvrenResponseIds.has(evrenResponseId)) return false;
     session.accountedEvrenResponseIds.add(evrenResponseId);
     session.usage.inputTokens += usage.inputTokens;
@@ -257,6 +278,19 @@ export class SessionStore {
     session.usage.totalTokens += usage.totalTokens;
     session.lastActivity = this.now();
     return true;
+  }
+
+  markForeground(session: Session): void {
+    if (this.sessions.get(session.id) !== session) {
+      throw new Error(`Cannot focus unknown session: ${session.id}`);
+    }
+    this.currentSessionId = session.id;
+  }
+
+  getCurrent(): Session | undefined {
+    this.prune();
+    const current = this.currentSessionId ? this.sessions.get(this.currentSessionId) : undefined;
+    return current ?? this.getLatest();
   }
 
   getLatest(): Session | undefined {
@@ -277,6 +311,7 @@ export class SessionStore {
       for (const callId of session.pendingToolCalls.keys()) this.callToSession.delete(callId);
       for (const callId of session.completedToolCalls.keys()) this.completedCallToSession.delete(callId);
       this.sessions.delete(id);
+      if (this.currentSessionId === id) this.currentSessionId = undefined;
       removed += 1;
     }
     return removed;

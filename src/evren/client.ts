@@ -15,6 +15,13 @@ export interface EvrenNativeResult {
   raw: unknown;
 }
 
+export interface EvrenCreditState {
+  held?: number;
+  remaining?: number;
+  uncertain: boolean;
+  updatedAt?: string;
+}
+
 export interface EvrenTransport {
   getModels(): Promise<unknown>;
   infer(input: string, maxOutputTokens: number): Promise<EvrenInferenceResult>;
@@ -22,6 +29,8 @@ export interface EvrenTransport {
 }
 
 export class EvrenClient implements EvrenTransport {
+  private creditState: EvrenCreditState = { uncertain: false };
+
   constructor(
     private readonly options: {
       baseUrl: string;
@@ -35,6 +44,10 @@ export class EvrenClient implements EvrenTransport {
 
   async getModels(): Promise<unknown> {
     return this.request("/models", { method: "GET" });
+  }
+
+  getCreditState(): EvrenCreditState {
+    return { ...this.creditState };
   }
 
   async infer(input: string, maxOutputTokens: number): Promise<EvrenInferenceResult> {
@@ -109,6 +122,7 @@ export class EvrenClient implements EvrenTransport {
         },
       });
       if (!response.ok) throw new Error(`EVREN returned HTTP ${response.status}.`);
+      if (pathname === "/responses") this.captureCreditHeaders(response.headers);
       return await response.json();
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") throw new Error("EVREN request timed out.");
@@ -117,4 +131,50 @@ export class EvrenClient implements EvrenTransport {
       clearTimeout(timer);
     }
   }
+
+  private captureCreditHeaders(headers: Headers): void {
+    const parsed = parseEvrenCreditHeaders(headers);
+    this.creditState = {
+      ...(parsed.held === undefined ? {} : { held: parsed.held }),
+      ...(parsed.remaining === undefined ? {} : { remaining: parsed.remaining }),
+      uncertain: parsed.invalidHeld || parsed.invalidRemaining,
+      updatedAt: new Date().toISOString(),
+    };
+    if (this.creditState.uncertain) {
+      this.options.logger.log({
+        event: "EVREN_CREDIT_HEADERS_INVALID",
+        level: "warn",
+        message: "EVREN returned an invalid credit header; the affected value is unavailable.",
+        data: {
+          invalidHeld: parsed.invalidHeld,
+          invalidRemaining: parsed.invalidRemaining,
+        },
+      });
+    }
+  }
+}
+
+export function parseEvrenCreditHeaders(headers: Pick<Headers, "get">): {
+  held?: number;
+  remaining?: number;
+  invalidHeld: boolean;
+  invalidRemaining: boolean;
+} {
+  const held = parseCreditHeader(headers.get("X-Evren-Credits-Held"));
+  const remaining = parseCreditHeader(headers.get("X-Evren-Credits-Remaining"));
+  return {
+    ...(held.value === undefined ? {} : { held: held.value }),
+    ...(remaining.value === undefined ? {} : { remaining: remaining.value }),
+    invalidHeld: held.invalid,
+    invalidRemaining: remaining.invalid,
+  };
+}
+
+function parseCreditHeader(raw: string | null): { value?: number; invalid: boolean } {
+  if (raw === null) return { invalid: false };
+  const trimmed = raw.trim();
+  if (!/^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(trimmed)) return { invalid: true };
+  const value = Number(trimmed);
+  if (!Number.isFinite(value) || value < 0) return { invalid: true };
+  return { value, invalid: false };
 }

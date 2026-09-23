@@ -5,6 +5,7 @@ import type { PricingGuard } from "../safety/pricing-guard.js";
 import type { SessionStore } from "../sessions/store.js";
 import type { UsageTracker } from "../usage/tracker.js";
 import type { EventSink } from "../ui/logger.js";
+import type { EvrenCreditState } from "../evren/client.js";
 import { registerHealthRoute } from "./health.js";
 import { registerModelsRoute } from "./models.js";
 import { registerResponsesRoute } from "./responses.js";
@@ -16,6 +17,7 @@ export function buildServer(deps: {
   usage: UsageTracker;
   bridge: BridgeService;
   logger: EventSink;
+  credits?: { getCreditState(): EvrenCreditState };
 }): FastifyInstance {
   const app = Fastify({ logger: false, bodyLimit: 20 * 1024 * 1024 });
   registerHealthRoute(app, deps);

@@ -2,6 +2,7 @@ export interface ModelPricing {
   promptTokenPrice: number;
   completionTokenPrice: number;
   currency: string;
+  freeUntil?: string;
 }
 
 export type PricingEvaluation =
@@ -14,12 +15,13 @@ export function evaluateModelPricing(payload: unknown, model: string): PricingEv
   if (!Array.isArray(data)) return { allowed: false, reason: "Pricing response is missing the data array." };
   const entry = data.find(
     (candidate) => candidate && typeof candidate === "object" && (candidate as { id?: unknown }).id === model,
-  ) as { pricing?: unknown } | undefined;
+  ) as { pricing?: unknown; free_until?: unknown } | undefined;
   if (!entry) return { allowed: false, reason: `Model ${model} was not found in the EVREN catalog.` };
   if (!entry.pricing || typeof entry.pricing !== "object") {
     return { allowed: false, reason: `Pricing metadata is missing for ${model}.` };
   }
   const raw = entry.pricing as Record<string, unknown>;
+  const freeUntil = raw.free_until ?? entry.free_until;
   if (
     typeof raw.prompt_token_price !== "number" ||
     !Number.isFinite(raw.prompt_token_price) ||
@@ -33,6 +35,9 @@ export function evaluateModelPricing(payload: unknown, model: string): PricingEv
     promptTokenPrice: raw.prompt_token_price,
     completionTokenPrice: raw.completion_token_price,
     currency: raw.currency,
+    ...(typeof freeUntil === "string" && freeUntil.trim().length > 0
+      ? { freeUntil: freeUntil.trim().slice(0, 100) }
+      : {}),
   };
   if (pricing.promptTokenPrice !== 0 || pricing.completionTokenPrice !== 0 || pricing.currency !== "CR") {
     return { allowed: false, reason: `Pricing is not exactly 0 CR for ${model}.`, pricing };

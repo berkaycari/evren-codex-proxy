@@ -16,6 +16,7 @@ coverage/
 *.pfx
 
 # Runtime state and logs: retain only tracked directory markers
+config/local.json
 data/*
 !data/.gitkeep
 logs/*

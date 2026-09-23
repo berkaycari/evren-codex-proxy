@@ -11,6 +11,7 @@ export type NativeEvrenDecision = {
   name: string;
   arguments: Record<string, unknown>;
   argumentsJson: string;
+  returnedCallCount: number;
 };
 
 export function parseNativeEvrenResponse(
@@ -22,10 +23,7 @@ export function parseNativeEvrenResponse(
   }
   const output = (raw as { output: unknown[] }).output;
   const calls = output.filter((item) => isRecord(item) && item.type === "function_call") as Record<string, unknown>[];
-  if (calls.length > 1) {
-    throw protocolError(`EVREN returned ${calls.length} function calls; sequential mode permits exactly one.`);
-  }
-  if (calls.length === 1) return parseFunctionCall(calls[0]!, tools);
+  if (calls.length > 0) return parseFunctionCall(calls[0]!, tools, calls.length);
 
   try {
     return { kind: "final", content: extractResponseText(raw) };
@@ -37,6 +35,7 @@ export function parseNativeEvrenResponse(
 function parseFunctionCall(
   call: Record<string, unknown>,
   tools: ReadonlyMap<string, NormalizedTool>,
+  returnedCallCount: number,
 ): NativeEvrenDecision {
   if (typeof call.name !== "string" || typeof call.call_id !== "string" || !call.call_id
     || typeof call.arguments !== "string") {
@@ -63,6 +62,7 @@ function parseFunctionCall(
     name: call.name,
     arguments: parsed,
     argumentsJson: call.arguments,
+    returnedCallCount,
   };
 }
 

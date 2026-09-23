@@ -8,8 +8,18 @@ const requestSchema = z.object({
   tools: z.unknown().optional(),
   tool_choice: z.unknown().optional(),
   previous_response_id: z.string().optional(),
+  client_metadata: z.unknown().optional(),
   stream: z.boolean().optional(),
 }).passthrough();
+
+const FOREGROUND_REQUEST_KINDS = new Set(["turn", "review"]);
+const INTERNAL_REQUEST_KINDS = new Set([
+  "compact",
+  "memory",
+  "memory_consolidation",
+  "prewarm",
+  "thread_spawn",
+]);
 
 export interface NormalizedInputEntry {
   role: "user" | "assistant" | "tool";
@@ -25,6 +35,8 @@ export interface NormalizedCodexRequest {
   tools: NormalizedTool[];
   toolChoice: NormalizedToolChoice;
   previousResponseId?: string;
+  requestKind?: string;
+  foreground: boolean;
   stream: boolean;
   unknownFields: string[];
 }
@@ -36,7 +48,7 @@ export type NormalizedToolChoice = "auto" | "required" | "none" | {
 
 const KNOWN_FIELDS = new Set([
   "model", "instructions", "input", "tools", "tool_choice", "parallel_tool_calls",
-  "previous_response_id", "stream", "reasoning", "metadata", "store", "include", "text",
+  "previous_response_id", "client_metadata", "stream", "reasoning", "metadata", "store", "include", "text",
 ]);
 
 export function normalizeCodexRequest(body: unknown): NormalizedCodexRequest {
@@ -44,6 +56,7 @@ export function normalizeCodexRequest(body: unknown): NormalizedCodexRequest {
   if (!parsed.success) throw new InvalidRequestError("Request body must be a JSON object with valid field types.");
   const value = parsed.data;
   const entries = normalizeInput(value.input);
+  const requestKind = normalizeRequestKind(value.client_metadata);
   return {
     ...(value.model === undefined ? {} : { model: value.model }),
     instructions: value.instructions ?? "",
@@ -52,9 +65,36 @@ export function normalizeCodexRequest(body: unknown): NormalizedCodexRequest {
     tools: normalizeTools(value.tools),
     toolChoice: normalizeToolChoice(value.tool_choice),
     ...(value.previous_response_id === undefined ? {} : { previousResponseId: value.previous_response_id }),
+    ...(requestKind === undefined ? {} : { requestKind }),
+    foreground: requestKind === undefined ? value.client_metadata === undefined : isForegroundRequest(requestKind),
     stream: value.stream ?? false,
     unknownFields: Object.keys(value).filter((key) => !KNOWN_FIELDS.has(key)),
   };
+}
+
+function normalizeRequestKind(clientMetadata: unknown): string | undefined {
+  if (!clientMetadata || typeof clientMetadata !== "object" || Array.isArray(clientMetadata)) return undefined;
+  const encoded = (clientMetadata as Record<string, unknown>)["x-codex-turn-metadata"];
+  if (typeof encoded !== "string") return undefined;
+  try {
+    const metadata = JSON.parse(encoded) as unknown;
+    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return undefined;
+    const requestKind = (metadata as Record<string, unknown>).request_kind;
+    if (typeof requestKind !== "string") return undefined;
+    const normalized = requestKind.trim();
+    return FOREGROUND_REQUEST_KINDS.has(normalized) || INTERNAL_REQUEST_KINDS.has(normalized)
+      ? normalized
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isForegroundRequest(requestKind: string | undefined): boolean {
+  if (requestKind === undefined) return true;
+  if (FOREGROUND_REQUEST_KINDS.has(requestKind)) return true;
+  if (INTERNAL_REQUEST_KINDS.has(requestKind)) return false;
+  return false;
 }
 
 function normalizeToolChoice(value: unknown): NormalizedToolChoice {

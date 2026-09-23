@@ -1,5 +1,6 @@
 import type { PricingState } from "../safety/pricing-guard.js";
 import type { Session } from "../sessions/store.js";
+import type { EvrenCreditState } from "../evren/client.js";
 import type { DailyUsageSnapshot } from "../usage/tracker.js";
 import type { RecentLogEvent } from "./logger.js";
 
@@ -43,6 +44,7 @@ export interface DashboardSnapshot {
   transport: "native" | "textual";
   version: string;
   pricing: PricingState;
+  credits: EvrenCreditState;
   session?: Session;
   daily: DailyUsageSnapshot;
   limits: {
@@ -122,10 +124,12 @@ export function buildDashboardLines(
   const sessionTokens = session?.usage.totalTokens ?? 0;
   const tools = session?.toolCallCount ?? 0;
   const pricingText = snapshot.pricing.pricing
-    ? `${snapshot.pricing.pricing.promptTokenPrice} / ${snapshot.pricing.pricing.completionTokenPrice} ${snapshot.pricing.pricing.currency}`
+    ? `prompt ${snapshot.pricing.pricing.promptTokenPrice} · completion ${snapshot.pricing.pricing.completionTokenPrice} ${snapshot.pricing.pricing.currency}`
     : "unverified";
   const stage = deriveDashboardStage(recent);
-  const lastRun = deriveLastRun(recent);
+  const lastUsage = session?.lastUsage
+    ? `in ${formatNumber(session.lastUsage.inputTokens)} · out ${formatNumber(session.lastUsage.outputTokens)}`
+    : "—";
   const statusColor = snapshot.status === "ONLINE" ? green : red;
   const header = fit(`EVREN CODEX BRIDGE · v${snapshot.version}`, inner);
   const status = boxedPair("●", snapshot.status, "Transport", snapshot.transport, inner);
@@ -135,8 +139,12 @@ export function buildDashboardLines(
     `│${cyan}${center(header.trimEnd(), inner)}${reset}│`,
     divider(inner, "├", "┤"),
     colorFirst(status, `● ${snapshot.status}`, statusColor),
-    boxedPair("Model", snapshot.model, "Proxy", snapshot.listen, inner),
-    colorFirst(boxedPair("EVREN", snapshot.pricing.connected ? "connected" : "disconnected", "Pricing", pricingText, inner), snapshot.pricing.connected ? "connected" : "disconnected", snapshot.pricing.connected ? green : red),
+    colorFirst(boxedPair("Model", snapshot.model, "EVREN", snapshot.pricing.connected ? "connected" : "disconnected", inner), snapshot.pricing.connected ? "connected" : "disconnected", snapshot.pricing.connected ? green : red),
+    boxedText(`Pricing  ${pricingText}`, inner),
+    ...(snapshot.pricing.pricing?.freeUntil
+      ? [boxedText(`Free until  ${snapshot.pricing.pricing.freeUntil}`, inner)]
+      : []),
+    boxedPair("Credits Held", formatCredit(snapshot.credits.held), "Remaining", formatCredit(snapshot.credits.remaining), inner),
     divider(inner, "├", "┤"),
     colorFirst(boxedText("FLOW", inner), "FLOW", cyan),
     decorateFlow(boxedText("READY → CODEX → EVREN → TOOL → RESULT → FINAL", inner), stage),
@@ -144,7 +152,7 @@ export function buildDashboardLines(
     divider(inner, "├", "┤"),
     boxedPair("Requests", `${formatNumber(requestCount)} / ${formatNumber(snapshot.limits.requests)}`, "Tools", `${formatNumber(tools)} / ${formatNumber(snapshot.limits.toolCalls)}`, inner),
     boxedPair("Session", `${formatNumber(sessionTokens)} / ${formatNumber(snapshot.limits.sessionTokens)}`, "Daily", `${formatNumber(snapshot.daily.totalTokens)} / ${formatNumber(snapshot.limits.dailyTokens)}`, inner),
-    colorFirst(boxedPair("Usage", progress(sessionTokens, snapshot.limits.sessionTokens, Math.max(4, Math.floor(inner / 3))), "Last", lastRun, inner), lastRun, lastRun.startsWith("FINAL") ? green : lastRun === "ERROR" ? red : gray),
+    boxedPair("Usage", progress(sessionTokens, snapshot.limits.sessionTokens, Math.max(4, Math.floor(inner / 3))), "Last", lastUsage, inner),
     `╰${"─".repeat(inner)}╯`,
   ];
   const liveHeader = colorFirst(centerRule(`LIVE ACTIVITY · updated ${formatLocalTime(nowMs)}`, width), `updated ${formatLocalTime(nowMs)}`, gray);
@@ -168,15 +176,6 @@ export function deriveDashboardStage(recent: ReadonlyArray<RecentLogEvent>): Das
     if (event === "PROXY_STARTED" || event === "PRICING_CHECK_OK") return "READY";
   }
   return "READY";
-}
-
-function deriveLastRun(recent: ReadonlyArray<RecentLogEvent>): string {
-  for (let index = recent.length - 1; index >= 0; index -= 1) {
-    const event = recent[index]?.event;
-    if (event === "RESPONSE_FINALIZED") return "FINAL ✓";
-    if (event === "ERROR") return "ERROR";
-  }
-  return "—";
 }
 
 function formatActivity(event: RecentLogEvent, width: number): string {
@@ -307,4 +306,8 @@ export function formatLocalTime(value: string | number | Date): string {
 
 function formatNumber(value: number): string {
   return value.toLocaleString("en-US");
+}
+
+function formatCredit(value: number | undefined): string {
+  return value === undefined ? "—" : `${value.toFixed(4)} CR`;
 }
