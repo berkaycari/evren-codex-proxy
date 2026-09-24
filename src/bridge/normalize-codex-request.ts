@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { normalizeTools, type NormalizedTool } from "./tool-protocol.js";
+import type { RequestClassification } from "../usage/types.js";
 
 const requestSchema = z.object({
   model: z.string().optional(),
@@ -36,6 +37,7 @@ export interface NormalizedCodexRequest {
   toolChoice: NormalizedToolChoice;
   previousResponseId?: string;
   requestKind?: string;
+  requestClassification: RequestClassification;
   foreground: boolean;
   stream: boolean;
   unknownFields: string[];
@@ -66,10 +68,17 @@ export function normalizeCodexRequest(body: unknown): NormalizedCodexRequest {
     toolChoice: normalizeToolChoice(value.tool_choice),
     ...(value.previous_response_id === undefined ? {} : { previousResponseId: value.previous_response_id }),
     ...(requestKind === undefined ? {} : { requestKind }),
+    requestClassification: classifyRequest(requestKind),
     foreground: requestKind === undefined ? value.client_metadata === undefined : isForegroundRequest(requestKind),
     stream: value.stream ?? false,
     unknownFields: Object.keys(value).filter((key) => !KNOWN_FIELDS.has(key)),
   };
+}
+
+function classifyRequest(requestKind: string | undefined): RequestClassification {
+  if (requestKind !== undefined && INTERNAL_REQUEST_KINDS.has(requestKind)) return "internal";
+  if (requestKind !== undefined && FOREGROUND_REQUEST_KINDS.has(requestKind)) return "foreground";
+  return "unclassified";
 }
 
 function normalizeRequestKind(clientMetadata: unknown): string | undefined {

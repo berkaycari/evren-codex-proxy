@@ -1,5 +1,10 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import {
+  emptyClassifiedUsageTotals,
+  type ClassifiedUsageTotals,
+  type UsageTotals,
+} from "./types.js";
 
 export interface PersistedDailyUsage {
   date: string;
@@ -7,6 +12,7 @@ export interface PersistedDailyUsage {
   outputTokens: number;
   totalTokens: number;
   responseIds: string[];
+  classified: ClassifiedUsageTotals;
   updatedAt: string;
 }
 
@@ -17,15 +23,23 @@ export class UsagePersistence {
     const file = this.filePath(date);
     try {
       const parsed = JSON.parse(await readFile(file, "utf8")) as Partial<PersistedDailyUsage>;
+      const totals = parsed as Partial<UsageTotals>;
       if (
         parsed.date !== date ||
-        !Number.isSafeInteger(parsed.inputTokens) || (parsed.inputTokens ?? -1) < 0 ||
-        !Number.isSafeInteger(parsed.outputTokens) || (parsed.outputTokens ?? -1) < 0 ||
-        !Number.isSafeInteger(parsed.totalTokens) || (parsed.totalTokens ?? -1) < 0 ||
-        parsed.totalTokens !== (parsed.inputTokens ?? 0) + (parsed.outputTokens ?? 0) ||
+        !validUsageTotals(totals) ||
         !Array.isArray(parsed.responseIds) || parsed.responseIds.some((id) => typeof id !== "string")
       ) throw new Error(`Usage file ${file} is invalid.`);
-      return parsed as PersistedDailyUsage;
+      const classified = parsed.classified === undefined
+        ? {
+          ...emptyClassifiedUsageTotals(),
+          unclassified: {
+            inputTokens: parsed.inputTokens!,
+            outputTokens: parsed.outputTokens!,
+            totalTokens: parsed.totalTokens!,
+          },
+        }
+        : parseClassifiedUsage(parsed.classified, totals, file);
+      return { ...(parsed as PersistedDailyUsage), classified };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       return {
@@ -34,6 +48,7 @@ export class UsagePersistence {
         outputTokens: 0,
         totalTokens: 0,
         responseIds: [],
+        classified: emptyClassifiedUsageTotals(),
         updatedAt: new Date().toISOString(),
       };
     }
@@ -50,6 +65,40 @@ export class UsagePersistence {
   private filePath(date: string): string {
     return path.join(this.dataDir, `usage-${date}.json`);
   }
+}
+
+function parseClassifiedUsage(value: unknown, totals: UsageTotals, file: string): ClassifiedUsageTotals {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Usage file ${file} has invalid classified usage.`);
+  }
+  const record = value as Record<string, unknown>;
+  const classified = emptyClassifiedUsageTotals();
+  for (const key of ["foreground", "internal", "unclassified"] as const) {
+    const candidate = record[key];
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)
+      || !validUsageTotals(candidate as Partial<UsageTotals>)) {
+      throw new Error(`Usage file ${file} has invalid classified usage.`);
+    }
+    classified[key] = candidate as UsageTotals;
+  }
+  const sum = Object.values(classified).reduce((result, usage) => ({
+    inputTokens: result.inputTokens + usage.inputTokens,
+    outputTokens: result.outputTokens + usage.outputTokens,
+    totalTokens: result.totalTokens + usage.totalTokens,
+  }), { inputTokens: 0, outputTokens: 0, totalTokens: 0 });
+  if (sum.inputTokens !== totals.inputTokens
+    || sum.outputTokens !== totals.outputTokens
+    || sum.totalTokens !== totals.totalTokens) {
+    throw new Error(`Usage file ${file} classified totals do not match authoritative totals.`);
+  }
+  return classified;
+}
+
+function validUsageTotals(value: Partial<UsageTotals>): value is UsageTotals {
+  return Number.isSafeInteger(value.inputTokens) && (value.inputTokens ?? -1) >= 0
+    && Number.isSafeInteger(value.outputTokens) && (value.outputTokens ?? -1) >= 0
+    && Number.isSafeInteger(value.totalTokens) && (value.totalTokens ?? -1) >= 0
+    && value.totalTokens === (value.inputTokens ?? 0) + (value.outputTokens ?? 0);
 }
 
 export function localDate(now: Date): string {

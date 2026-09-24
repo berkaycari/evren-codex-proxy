@@ -16,9 +16,12 @@ describe("local bridge configuration", () => {
       maxEstimatedInputTokensPerCall: 70_000,
       maxOutputTokensPerCall: 2_048,
       toolOutputMaxChars: 40_000,
+      toolPollWarningThreshold: 4,
+      maxConsecutiveToolPollInferences: 0,
       sessionTtlMinutes: 45,
       pricingRefreshMinutes: 15,
       requestTimeoutMs: 90_000,
+      updateCheckEnabled: false,
     }), "utf8");
 
     const config = loadConfig({ MAX_SESSION_TOKENS: "222222" }, { localConfigPath });
@@ -31,16 +34,41 @@ describe("local bridge configuration", () => {
       maxEstimatedInputTokensPerCall: 70_000,
       maxOutputTokensPerCall: 2_048,
       toolOutputMaxChars: 40_000,
+      toolPollWarningThreshold: 4,
+      maxConsecutiveToolPollInferences: 0,
       sessionTtlMinutes: 45,
       pricingRefreshMinutes: 15,
       requestTimeoutMs: 90_000,
+      updateCheckEnabled: false,
     });
     expect(config.port).toBe(8787);
   });
 
+  it("keeps environment precedence for polling protection and update opt-out", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "evren-config-precedence-"));
+    const localConfigPath = path.join(directory, "local.json");
+    await writeFile(localConfigPath, JSON.stringify({
+      maxConsecutiveToolPollInferences: 9,
+      updateCheckEnabled: true,
+    }), "utf8");
+    expect(loadConfig({
+      MAX_CONSECUTIVE_TOOL_POLL_INFERENCES: "0",
+      UPDATE_CHECK_ENABLED: "false",
+    }, { localConfigPath })).toMatchObject({
+      maxConsecutiveToolPollInferences: 0,
+      updateCheckEnabled: false,
+    });
+  });
+
   it("does not require config/local.json to exist", () => {
     const missing = path.join(os.tmpdir(), `evren-missing-${Date.now()}`, "local.json");
-    expect(loadConfig({}, { localConfigPath: missing }).maxSessionTokens).toBe(400_000);
+    expect(loadConfig({}, { localConfigPath: missing })).toMatchObject({
+      maxSessionTokens: 1_200_000,
+      maxDailyTokens: 10_000_000,
+      maxRequestsPerSession: 60,
+      maxToolCallsPerSession: 80,
+      maxOutputTokensPerCall: 4_096,
+    });
   });
 
   it.each([
@@ -51,6 +79,8 @@ describe("local bridge configuration", () => {
     ["negative", JSON.stringify({ maxSessionTokens: -1 })],
     ["fraction", JSON.stringify({ maxSessionTokens: 1.5 })],
     ["unsafe integer", JSON.stringify({ maxSessionTokens: Number.MAX_SAFE_INTEGER + 1 })],
+    ["invalid update flag", JSON.stringify({ updateCheckEnabled: "false" })],
+    ["negative polling cap", JSON.stringify({ maxConsecutiveToolPollInferences: -1 })],
   ])("fails clearly for %s", async (_label, contents) => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "evren-config-invalid-"));
     const localConfigPath = path.join(directory, "local.json");

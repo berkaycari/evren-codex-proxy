@@ -50,6 +50,13 @@ export class EvrenClient implements EvrenTransport {
     return { ...this.creditState };
   }
 
+  setRequestTimeoutMs(timeoutMs: number): void {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+      throw new Error("EVREN request timeout must be a positive integer.");
+    }
+    this.options.timeoutMs = timeoutMs;
+  }
+
   async infer(input: string, maxOutputTokens: number): Promise<EvrenInferenceResult> {
     this.options.logger.log({ event: "EVREN_REQUEST", data: { inputChars: input.length, maxOutputTokens } });
     const body = {
@@ -68,7 +75,7 @@ export class EvrenClient implements EvrenTransport {
     const usage = extractUsage(raw);
     this.options.logger.log({
       event: "EVREN_RESPONSE",
-      data: { responseId: id, outputChars: text.length, hasUsage: usage !== undefined },
+      data: { outputChars: text.length, hasUsage: usage !== undefined },
     });
     return { id, text, ...(usage === undefined ? {} : { usage }), raw };
   }
@@ -103,7 +110,7 @@ export class EvrenClient implements EvrenTransport {
       : 0;
     this.options.logger.log({
       event: "EVREN_NATIVE_RESPONSE",
-      data: { responseId: id, outputItems: outputCount, hasUsage: usage !== undefined },
+      data: { outputItems: outputCount, hasUsage: usage !== undefined },
     });
     return { id, ...(usage === undefined ? {} : { usage }), raw };
   }

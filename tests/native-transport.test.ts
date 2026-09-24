@@ -703,7 +703,7 @@ describe("native bridge lifecycle", () => {
     expect(newTurnInput.match(/"call_id":"call_completed","output":"C:\\\\work"/g)).toHaveLength(1);
     expect(newTurnInput.match(new RegExp(nextQuestion.replace("?", "\\?"), "g"))).toHaveLength(1);
     expect(events.filter((event) => event.event === "TOOL_RESULT"
-      && event.data?.callId === "call_completed")).toHaveLength(1);
+      && event.data?.tool === "get_current_directory")).toHaveLength(1);
   });
 
   it("deduplicates canonical history around completed output replay on a new turn", async () => {

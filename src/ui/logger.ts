@@ -203,6 +203,12 @@ function safeEventDetail(entry: LogEvent, secrets: string[]): string | undefined
         numberDetail("bytes", data?.payloadBytes),
         numberDetail("items", data?.historyItems),
         numberDetail("tools", data?.toolCount),
+        numberDetail("instructions", data?.instructionBytes),
+        numberDetail("history", data?.canonicalHistoryBytes),
+        numberDetail("current", data?.currentInputBytes),
+        numberDetail("catalog", data?.toolCatalogBytes),
+        numberDetail("tool-output-history", data?.acceptedToolOutputBytes),
+        typeof data?.classification === "string" ? `class=${sanitizeText(data.classification, [], 20)}` : undefined,
       ]);
     case "NATIVE_TOOL_REQUEST":
     case "TOOL_REQUEST":
@@ -212,6 +218,20 @@ function safeEventDetail(entry: LogEvent, secrets: string[]): string | undefined
       return joinDetail([safeTool(data?.tool, secrets), numberDetail("chars", data?.chars)]);
     case "PRICING_CHECK_OK":
       return "0 CR verified";
+    case "TOOL_POLL":
+      return joinDetail([
+        safeTool(data?.toolName, secrets),
+        numberDetail("polls", data?.consecutivePolls),
+        numberDetail("tokens", data?.authoritativeTokensSpent),
+        numberDetail("elapsed", data?.elapsedSeconds),
+      ]);
+    case "OUTPUT_BUDGET_SATURATED":
+      return joinDetail([
+        numberDetail("output", data?.outputTokens),
+        numberDetail("limit", data?.maxOutputTokens),
+      ]);
+    case "UPDATE_AVAILABLE":
+      return typeof data?.version === "string" ? `v${sanitizeText(data.version, [], 20)}` : undefined;
     case "PROXY_STARTED":
       return "ready";
     case "RESPONSE_FINALIZED":

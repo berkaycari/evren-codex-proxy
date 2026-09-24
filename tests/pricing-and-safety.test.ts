@@ -1,20 +1,26 @@
 import { describe, expect, it } from "vitest";
+import os from "node:os";
+import path from "node:path";
 import { loadConfig } from "../src/config.js";
 import { evaluateModelPricing } from "../src/evren/pricing.js";
 import { assertRequestAllowed, LimitExceededError } from "../src/safety/limits.js";
 import { SessionStore } from "../src/sessions/store.js";
 import { redact } from "../src/ui/logger.js";
 
+function loadRepositoryDefaults() {
+  return loadConfig({}, { localConfigPath: path.join(os.tmpdir(), `evren-no-local-${process.pid}.json`) });
+}
+
 describe("pricing and safety", () => {
   it("uses the aligned platform quota while preserving local safety guards", () => {
-    const config = loadConfig({});
+    const config = loadRepositoryDefaults();
     expect(config).toMatchObject({
       toolTransport: "native",
       maxDailyTokens: 10_000_000,
       maxOutputTokensPerCall: 4_096,
-      maxSessionTokens: 400_000,
-      maxRequestsPerSession: 20,
-      maxToolCallsPerSession: 40,
+      maxSessionTokens: 1_200_000,
+      maxRequestsPerSession: 60,
+      maxToolCallsPerSession: 80,
       maxEstimatedInputTokensPerCall: 80_000,
       requestTimeoutMs: 120_000,
     });
@@ -38,31 +44,37 @@ describe("pricing and safety", () => {
   });
 
   it("allows only exact numeric zero CR pricing", () => {
-    const result = evaluateModelPricing({ data: [{
-      id: "deepseek-v4.1-flash",
-      pricing: { prompt_token_price: 0, completion_token_price: 0, currency: "CR" },
-    }] }, "deepseek-v4.1-flash");
+    const result = evaluateModelPricing({
+      data: [{
+        id: "deepseek-v4.1-flash",
+        pricing: { prompt_token_price: 0, completion_token_price: 0, currency: "CR" },
+      }]
+    }, "deepseek-v4.1-flash");
     expect(result.allowed).toBe(true);
   });
 
   it("preserves optional free-until visibility without changing the zero-price guard", () => {
-    const result = evaluateModelPricing({ data: [{
-      id: "deepseek-v4.1-flash",
-      pricing: {
-        prompt_token_price: 0,
-        completion_token_price: 0,
-        currency: "CR",
-        free_until: "2026-11-01",
-      },
-    }] }, "deepseek-v4.1-flash");
+    const result = evaluateModelPricing({
+      data: [{
+        id: "deepseek-v4.1-flash",
+        pricing: {
+          prompt_token_price: 0,
+          completion_token_price: 0,
+          currency: "CR",
+          free_until: "2026-11-01",
+        },
+      }]
+    }, "deepseek-v4.1-flash");
     expect(result).toMatchObject({ allowed: true, pricing: { freeUntil: "2026-11-01" } });
   });
 
   it("blocks positive pricing", () => {
-    const result = evaluateModelPricing({ data: [{
-      id: "deepseek-v4.1-flash",
-      pricing: { prompt_token_price: 0.001, completion_token_price: 0, currency: "CR" },
-    }] }, "deepseek-v4.1-flash");
+    const result = evaluateModelPricing({
+      data: [{
+        id: "deepseek-v4.1-flash",
+        pricing: { prompt_token_price: 0.001, completion_token_price: 0, currency: "CR" },
+      }]
+    }, "deepseek-v4.1-flash");
     expect(result.allowed).toBe(false);
   });
 
@@ -71,7 +83,7 @@ describe("pricing and safety", () => {
   });
 
   it("enforces session and daily token limits", () => {
-    const config = loadConfig({});
+    const config = loadRepositoryDefaults();
     const session = new SessionStore(60_000).resolve();
     session.usage.totalTokens = config.maxSessionTokens;
     expect(() => assertRequestAllowed(config, session, {
@@ -89,7 +101,7 @@ describe("pricing and safety", () => {
   });
 
   it("enforces request count limits", () => {
-    const config = loadConfig({});
+    const config = loadRepositoryDefaults();
     const session = new SessionStore(60_000).resolve();
     session.requestCount = config.maxRequestsPerSession;
     expect(() => assertRequestAllowed(config, session, {

@@ -449,8 +449,7 @@ describe("HTTP server", () => {
     expect((finalPrompt.match(new RegExp(original, "g")) ?? [])).toHaveLength(1);
     expect((finalPrompt.match(new RegExp(outputA, "g")) ?? [])).toHaveLength(1);
     expect((finalPrompt.match(new RegExp(outputB, "g")) ?? [])).toHaveLength(1);
-    expect(events.filter((event) => event.event === "TOOL_RESULT" && event.data?.callId === callA)).toHaveLength(1);
-    expect(events.filter((event) => event.event === "TOOL_RESULT" && event.data?.callId === callB)).toHaveLength(1);
+    expect(events.filter((event) => event.event === "TOOL_RESULT")).toHaveLength(2);
   });
 
   it("rejects changed completed history even when the current pending output is valid", async () => {

@@ -9,6 +9,7 @@ import { PricingBlockedError } from "../safety/pricing-guard.js";
 import { InvalidToolCallSessionError, UnknownPreviousResponseError } from "../sessions/store.js";
 import { AccountingUncertainError } from "../usage/tracker.js";
 import { RetryCircuitBlockedError } from "../safety/deterministic-retry-circuit.js";
+import { ToolPollLimitError } from "../bridge/tool-polling.js";
 import type { EventSink } from "../ui/logger.js";
 
 export function registerResponsesRoute(
@@ -46,7 +47,8 @@ function sendError(reply: FastifyReply, error: unknown): FastifyReply {
   if (error instanceof InvalidRequestError
     || error instanceof InvalidNativeToolChoiceError
     || error instanceof UnknownPreviousResponseError
-    || error instanceof InvalidToolCallSessionError) {
+    || error instanceof InvalidToolCallSessionError
+    || error instanceof ToolPollLimitError) {
     status = 400;
     type = "invalid_request_error";
     code = error.code;

@@ -1,11 +1,13 @@
 import type { EvrenUsage } from "../evren/extract-response.js";
 import { localDate, UsagePersistence, type PersistedDailyUsage } from "./persistence.js";
+import { addUsage, type ClassifiedUsageTotals, type RequestClassification } from "./types.js";
 
 export interface DailyUsageSnapshot {
   date: string;
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  classified?: ClassifiedUsageTotals;
   accountingCertain: boolean;
 }
 
@@ -30,6 +32,7 @@ export class UsageTracker {
       inputTokens: usage.inputTokens,
       outputTokens: usage.outputTokens,
       totalTokens: usage.totalTokens,
+      classified: structuredClone(usage.classified),
       accountingCertain: this.certain,
     };
   }
@@ -42,7 +45,11 @@ export class UsageTracker {
     this.certain = false;
   }
 
-  async record(responseId: string, usage: EvrenUsage): Promise<boolean> {
+  async record(
+    responseId: string,
+    usage: EvrenUsage,
+    classification: RequestClassification = "unclassified",
+  ): Promise<boolean> {
     let recorded = false;
     this.queue = this.queue.then(async () => {
       await this.rollDateIfNeeded();
@@ -52,6 +59,7 @@ export class UsageTracker {
       current.inputTokens += usage.inputTokens;
       current.outputTokens += usage.outputTokens;
       current.totalTokens += usage.totalTokens;
+      addUsage(current.classified[classification], usage);
       current.updatedAt = this.now().toISOString();
       await this.persistence.save(current);
       recorded = true;

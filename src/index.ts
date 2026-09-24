@@ -2,15 +2,21 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { BridgeService } from "./bridge/bridge-service.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, type BridgeConfig } from "./config.js";
 import { EvrenClient } from "./evren/client.js";
+import {
+  executeConfigurationFlow,
+  rebindRuntimeConfiguration,
+  RuntimeRollbackError,
+} from "./runtime/configuration.js";
 import { PricingGuard } from "./safety/pricing-guard.js";
 import { SessionStore } from "./sessions/store.js";
 import { buildServer } from "./server/app.js";
-import { Dashboard } from "./ui/dashboard.js";
+import { Dashboard, type DashboardConfigurationRequest } from "./ui/dashboard.js";
 import { SafeLogger } from "./ui/logger.js";
 import { UsagePersistence } from "./usage/persistence.js";
 import { UsageTracker } from "./usage/tracker.js";
+import { UpdateChecker } from "./update/checker.js";
 
 let restoreTerminal = (): void => undefined;
 let cleanupStartupFailure = async (): Promise<void> => {
@@ -50,11 +56,30 @@ async function main(): Promise<void> {
     logger,
   });
   const pricingGuard = new PricingGuard(client, config.model, logger);
+  const updateChecker = new UpdateChecker({
+    enabled: config.updateCheckEnabled,
+    currentVersion: packageVersion,
+    logger,
+  });
   const pricing = await pricingGuard.refresh();
   pricingGuard.startPeriodic(config.pricingRefreshMinutes);
   const bridge = new BridgeService({ config, client, pricingGuard, sessions, usage, logger });
-  const app = buildServer({ config, pricingGuard, sessions, usage, bridge, logger, credits: client });
-  const dashboard = new Dashboard(logger);
+  const buildApp = () => buildServer({
+    config,
+    pricingGuard,
+    sessions,
+    usage,
+    bridge,
+    logger,
+    credits: client,
+    updateCheck: updateChecker,
+  });
+  let app = buildApp();
+  let currentPreset: "Standard" | "Coding" | "Custom" | "Custom/current" = "Custom/current";
+  const dashboard = new Dashboard(logger, {
+    onConfigure: configureFromDashboard,
+    onInterrupt: handleShutdown,
+  });
 
   restoreTerminal = (): void => {
     try {
@@ -74,9 +99,6 @@ async function main(): Promise<void> {
   };
 
   await app.listen({ host: config.host, port: config.port });
-  dashboard.start();
-  process.once("exit", restoreTerminal);
-  process.on("uncaughtExceptionMonitor", restoreTerminal);
   let lastDashboardFingerprint = "";
 
   const render = (): void => {
@@ -84,6 +106,7 @@ async function main(): Promise<void> {
     const pricingState = pricingGuard.getState();
     const daily = usage.snapshot();
     const credits = client.getCreditState();
+    const update = updateChecker.getState();
     const lastAction = logger.getRecent().at(-1)?.event ?? "Waiting for Codex";
 
     const status =
@@ -102,6 +125,17 @@ async function main(): Promise<void> {
         values: pricingState.pricing,
       },
       credits,
+      update,
+      config: {
+        preset: currentPreset,
+        requests: config.maxRequestsPerSession,
+        sessionTokens: config.maxSessionTokens,
+        dailyTokens: config.maxDailyTokens,
+        toolCalls: config.maxToolCallsPerSession,
+        outputTokens: config.maxOutputTokensPerCall,
+        pollWarning: config.toolPollWarningThreshold,
+        pollHardCap: config.maxConsecutiveToolPollInferences,
+      },
       session: session
         ? {
           id: session.id,
@@ -110,6 +144,10 @@ async function main(): Promise<void> {
           inputTokens: session.usage.inputTokens,
           outputTokens: session.usage.outputTokens,
           totalTokens: session.usage.totalTokens,
+          inferenceCount: session.inferenceCount,
+          pollCount: session.polling.active?.consecutivePolls ?? 0,
+          pollTokens: session.polling.active?.authoritativeTokensSpent ?? 0,
+          outputBudgetSaturated: session.lastOutputBudgetSaturated,
         }
         : null,
       daily: {
@@ -137,6 +175,7 @@ async function main(): Promise<void> {
       version: packageVersion,
       pricing: pricingState,
       credits,
+      update,
       ...(session === undefined ? {} : { session }),
       daily,
       limits: {
@@ -144,8 +183,27 @@ async function main(): Promise<void> {
         sessionTokens: config.maxSessionTokens,
         dailyTokens: config.maxDailyTokens,
         toolCalls: config.maxToolCallsPerSession,
+        outputTokens: config.maxOutputTokensPerCall,
+        pollWarning: config.toolPollWarningThreshold,
+        pollHardCap: config.maxConsecutiveToolPollInferences,
       },
+      preset: currentPreset,
       lastAction,
+      customConfiguration: {
+        maxSessionTokens: config.maxSessionTokens,
+        maxDailyTokens: config.maxDailyTokens,
+        maxRequestsPerSession: config.maxRequestsPerSession,
+        maxToolCallsPerSession: config.maxToolCallsPerSession,
+        maxEstimatedInputTokensPerCall: config.maxEstimatedInputTokensPerCall,
+        maxOutputTokensPerCall: config.maxOutputTokensPerCall,
+        sessionTtlMinutes: config.sessionTtlMinutes,
+        toolOutputMaxChars: config.toolOutputMaxChars,
+        toolPollWarningThreshold: config.toolPollWarningThreshold,
+        maxConsecutiveToolPollInferences: config.maxConsecutiveToolPollInferences,
+        pricingRefreshMinutes: config.pricingRefreshMinutes,
+        requestTimeoutMs: config.requestTimeoutMs,
+        updateCheckEnabled: config.updateCheckEnabled,
+      },
     });
   };
 
@@ -156,6 +214,51 @@ async function main(): Promise<void> {
     data: { host: config.host, port: config.port, model: config.model, pricingAllowed: pricing.allowed },
   });
   render();
+  void updateChecker.checkOnce();
+
+  async function configureFromDashboard(request: DashboardConfigurationRequest) {
+    const result = await executeConfigurationFlow({
+      projectRoot,
+      preset: request.preset,
+      ...(request.customConfiguration === undefined ? {} : { customConfiguration: request.customConfiguration }),
+      loadEffectiveConfig: () => loadConfig(),
+      applyEffectiveConfig,
+    });
+    if (result.status === "applied") currentPreset = result.preset ?? "Custom/current";
+    lastDashboardFingerprint = "";
+    render();
+    return result;
+  }
+
+  async function applyEffectiveConfig(nextConfig: BridgeConfig): Promise<void> {
+    try {
+      await rebindRuntimeConfiguration({
+        currentConfig: config,
+        nextConfig,
+        getServer: () => app,
+        setServer: (nextApp) => { app = nextApp; },
+        buildServer: buildApp,
+        applyRuntimeValues,
+      });
+      if (updateChecker.getState().status === "not_checked") void updateChecker.checkOnce();
+    } catch (error) {
+      if (error instanceof RuntimeRollbackError) {
+        restoreTerminal();
+        process.exitCode = 1;
+      } else if (updateChecker.getState().status === "not_checked") {
+        void updateChecker.checkOnce();
+      }
+      throw error;
+    }
+  }
+
+  function applyRuntimeValues(nextConfig: BridgeConfig): void {
+    Object.assign(config, nextConfig);
+    client.setRequestTimeoutMs(nextConfig.requestTimeoutMs);
+    sessions.setTtlMs(nextConfig.sessionTtlMinutes * 60_000);
+    pricingGuard.startPeriodic(nextConfig.pricingRefreshMinutes);
+    updateChecker.setEnabled(nextConfig.updateCheckEnabled);
+  }
 
   let shuttingDown = false;
   const shutdown = async (): Promise<void> => {
@@ -169,15 +272,18 @@ async function main(): Promise<void> {
     pricingGuard.stopPeriodic();
     await app.close();
   };
-  const handleShutdown = (): void => {
+  function handleShutdown(): void {
     void shutdown().catch((error: unknown) => {
       restoreTerminal();
       console.error(`Bridge shutdown failed: ${error instanceof Error ? error.message : "unknown error"}`);
       process.exitCode = 1;
     });
-  };
+  }
   process.once("SIGINT", handleShutdown);
   process.once("SIGTERM", handleShutdown);
+  process.once("exit", restoreTerminal);
+  process.on("uncaughtExceptionMonitor", restoreTerminal);
+  dashboard.start();
 }
 
 main().catch(async (error: unknown) => {

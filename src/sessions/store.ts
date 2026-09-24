@@ -3,6 +3,12 @@ import type { NormalizedTool } from "../bridge/tool-protocol.js";
 import type { NativeEvrenInputItem } from "../bridge/native-codex-to-evren.js";
 import type { EvrenUsage } from "../evren/extract-response.js";
 import type { TranscriptEntry } from "./transcript.js";
+import {
+  addUsage,
+  emptyClassifiedUsageTotals,
+  type ClassifiedUsageTotals,
+  type RequestClassification,
+} from "../usage/types.js";
 
 export interface SessionUsage {
   inputTokens: number;
@@ -14,6 +20,23 @@ export interface PendingToolCall {
   callId: string;
   tool: NormalizedTool;
   stagedOutput?: string;
+  pollIdentityHash?: string;
+}
+
+export interface ActiveToolPollSequence {
+  toolName: string;
+  identityHash: string;
+  consecutivePolls: number;
+  authoritativeTokensSpent: number;
+  startedAt: Date;
+  lastPollAt: Date;
+  warningEmitted: boolean;
+}
+
+export interface SessionPolling {
+  active?: ActiveToolPollSequence;
+  totalPollInferences: number;
+  totalAuthoritativeTokens: number;
 }
 
 export interface CompletedToolCall {
@@ -44,7 +67,10 @@ export interface Session {
   requestCount: number;
   inferenceCount: number;
   usage: SessionUsage;
+  usageByClass: ClassifiedUsageTotals;
   lastUsage?: EvrenUsage;
+  lastOutputBudgetSaturated: boolean;
+  outputBudgetSaturationCount: number;
   toolCallCount: number;
   transcript: TranscriptEntry[];
   nativeHistory: NativeEvrenInputItem[];
@@ -53,6 +79,7 @@ export interface Session {
   pendingToolCalls: Map<string, PendingToolCall>;
   completedToolCalls: Map<string, CompletedToolCall>;
   tools: Map<string, NormalizedTool>;
+  polling: SessionPolling;
 }
 
 export class UnknownPreviousResponseError extends Error {
@@ -71,9 +98,17 @@ export class SessionStore {
   private currentSessionId: string | undefined;
 
   constructor(
-    private readonly ttlMs: number,
+    private ttlMs: number,
     private readonly now: () => Date = () => new Date(),
   ) {}
+
+  setTtlMs(ttlMs: number): void {
+    if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) {
+      throw new Error("Session TTL must be a positive integer.");
+    }
+    this.ttlMs = ttlMs;
+    this.prune();
+  }
 
   resolve(previousResponseId?: string): Session {
     this.prune();
@@ -92,6 +127,9 @@ export class SessionStore {
       requestCount: 0,
       inferenceCount: 0,
       usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      usageByClass: emptyClassifiedUsageTotals(),
+      lastOutputBudgetSaturated: false,
+      outputBudgetSaturationCount: 0,
       toolCallCount: 0,
       transcript: [],
       nativeHistory: [],
@@ -100,6 +138,7 @@ export class SessionStore {
       pendingToolCalls: new Map(),
       completedToolCalls: new Map(),
       tools: new Map(),
+      polling: { totalPollInferences: 0, totalAuthoritativeTokens: 0 },
     };
     this.sessions.set(session.id, session);
     return session;
@@ -269,13 +308,19 @@ export class SessionStore {
     return completed;
   }
 
-  recordUsage(session: Session, evrenResponseId: string, usage: EvrenUsage): boolean {
+  recordUsage(
+    session: Session,
+    evrenResponseId: string,
+    usage: EvrenUsage,
+    classification: RequestClassification = "unclassified",
+  ): boolean {
     session.lastUsage = { ...usage };
     if (session.accountedEvrenResponseIds.has(evrenResponseId)) return false;
     session.accountedEvrenResponseIds.add(evrenResponseId);
     session.usage.inputTokens += usage.inputTokens;
     session.usage.outputTokens += usage.outputTokens;
     session.usage.totalTokens += usage.totalTokens;
+    addUsage(session.usageByClass[classification], usage);
     session.lastActivity = this.now();
     return true;
   }

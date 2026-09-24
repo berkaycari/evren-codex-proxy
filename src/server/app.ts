@@ -9,6 +9,7 @@ import type { EvrenCreditState } from "../evren/client.js";
 import { registerHealthRoute } from "./health.js";
 import { registerModelsRoute } from "./models.js";
 import { registerResponsesRoute } from "./responses.js";
+import type { UpdateCheckState } from "../update/checker.js";
 
 export function buildServer(deps: {
   config: BridgeConfig;
@@ -18,6 +19,7 @@ export function buildServer(deps: {
   bridge: BridgeService;
   logger: EventSink;
   credits?: { getCreditState(): EvrenCreditState };
+  updateCheck?: { getState(): UpdateCheckState };
 }): FastifyInstance {
   const app = Fastify({ logger: false, bodyLimit: 20 * 1024 * 1024 });
   registerHealthRoute(app, deps);

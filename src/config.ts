@@ -19,8 +19,11 @@ export interface BridgeConfig {
   maxOutputTokensPerCall: number;
   sessionTtlMinutes: number;
   toolOutputMaxChars: number;
+  toolPollWarningThreshold: number;
+  maxConsecutiveToolPollInferences: number;
   pricingRefreshMinutes: number;
   requestTimeoutMs: number;
+  updateCheckEnabled: boolean;
 }
 
 const ENV_NUMBERS: Record<string, keyof BridgeConfig> = {
@@ -33,6 +36,8 @@ const ENV_NUMBERS: Record<string, keyof BridgeConfig> = {
   MAX_OUTPUT_TOKENS_PER_CALL: "maxOutputTokensPerCall",
   SESSION_TTL_MINUTES: "sessionTtlMinutes",
   TOOL_OUTPUT_MAX_CHARS: "toolOutputMaxChars",
+  TOOL_POLL_WARNING_THRESHOLD: "toolPollWarningThreshold",
+  MAX_CONSECUTIVE_TOOL_POLL_INFERENCES: "maxConsecutiveToolPollInferences",
   PRICING_REFRESH_MINUTES: "pricingRefreshMinutes",
   EVREN_REQUEST_TIMEOUT_MS: "requestTimeoutMs",
 };
@@ -45,12 +50,18 @@ const LOCAL_NUMBER_KEYS = [
   "maxEstimatedInputTokensPerCall",
   "maxOutputTokensPerCall",
   "toolOutputMaxChars",
+  "toolPollWarningThreshold",
   "sessionTtlMinutes",
   "pricingRefreshMinutes",
   "requestTimeoutMs",
 ] as const satisfies ReadonlyArray<keyof BridgeConfig>;
 
+const LOCAL_NON_NEGATIVE_NUMBER_KEYS = [
+  "maxConsecutiveToolPollInferences",
+] as const satisfies ReadonlyArray<keyof BridgeConfig>;
+
 const localNumberKeys = new Set<string>(LOCAL_NUMBER_KEYS);
+const localNonNegativeNumberKeys = new Set<string>(LOCAL_NON_NEGATIVE_NUMBER_KEYS);
 
 export function loadConfig(
   env: NodeJS.ProcessEnv = process.env,
@@ -63,8 +74,9 @@ export function loadConfig(
     const raw = env[envName];
     if (raw === undefined) continue;
     const parsed = Number(raw);
-    if (!Number.isSafeInteger(parsed) || parsed <= 0) {
-      throw new Error(`${envName} must be a positive integer.`);
+    const nonNegative = key === "maxConsecutiveToolPollInferences";
+    if (!Number.isSafeInteger(parsed) || (nonNegative ? parsed < 0 : parsed <= 0)) {
+      throw new Error(`${envName} must be a ${nonNegative ? "non-negative" : "positive"} integer.`);
     }
     (config as unknown as Record<string, number>)[key] = parsed;
   }
@@ -74,6 +86,12 @@ export function loadConfig(
     throw new Error("EVREN_TOOL_TRANSPORT must be either native or textual.");
   }
   config.toolTransport = toolTransport ?? defaults.toolTransport;
+
+  const updateCheckEnabled = env.UPDATE_CHECK_ENABLED?.trim().toLowerCase();
+  if (updateCheckEnabled !== undefined && updateCheckEnabled !== "true" && updateCheckEnabled !== "false") {
+    throw new Error("UPDATE_CHECK_ENABLED must be true or false.");
+  }
+  if (updateCheckEnabled !== undefined) config.updateCheckEnabled = updateCheckEnabled === "true";
 
   // Security-critical values intentionally cannot be overridden by environment.
   config.host = "127.0.0.1";
@@ -103,11 +121,19 @@ function readLocalConfig(path: string): Partial<BridgeConfig> {
 
   const result: Partial<BridgeConfig> = {};
   for (const [key, raw] of Object.entries(value)) {
-    if (!localNumberKeys.has(key)) {
+    if (key === "updateCheckEnabled") {
+      if (typeof raw !== "boolean") {
+        throw new Error("Local configuration value updateCheckEnabled must be true or false.");
+      }
+      result.updateCheckEnabled = raw;
+      continue;
+    }
+    if (!localNumberKeys.has(key) && !localNonNegativeNumberKeys.has(key)) {
       throw new Error(`Unsupported local configuration key: ${key}. Secrets and runtime endpoints are not allowed.`);
     }
-    if (!Number.isSafeInteger(raw) || (raw as number) <= 0) {
-      throw new Error(`Local configuration value ${key} must be a positive integer.`);
+    const nonNegative = localNonNegativeNumberKeys.has(key);
+    if (!Number.isSafeInteger(raw) || (nonNegative ? (raw as number) < 0 : (raw as number) <= 0)) {
+      throw new Error(`Local configuration value ${key} must be a ${nonNegative ? "non-negative" : "positive"} integer.`);
     }
     (result as Record<string, number>)[key] = raw as number;
   }

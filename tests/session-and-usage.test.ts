@@ -15,6 +15,18 @@ describe("sessions and usage", () => {
     expect(() => store.resolve("resp_missing")).toThrowError(UnknownPreviousResponseError);
   });
 
+  it("applies a reconfigured session TTL to existing sessions", () => {
+    let now = new Date("2026-09-21T12:00:00.000Z");
+    const store = new SessionStore(60_000, () => now);
+    const session = store.resolve();
+    store.recordResponse(session, "resp_reconfigured_ttl");
+    now = new Date("2026-09-21T12:00:02.000Z");
+
+    store.setTtlMs(1_000);
+
+    expect(() => store.resolve("resp_reconfigured_ttl")).toThrowError(UnknownPreviousResponseError);
+  });
+
   it("removes pending call_id mappings when an expired session is pruned", () => {
     let now = new Date("2026-09-21T12:00:00.000Z");
     const store = new SessionStore(1_000, () => now);
@@ -75,5 +87,33 @@ describe("sessions and usage", () => {
     const file = path.join(temp, `usage-${tracker.snapshot().date}.json`);
     const persisted = JSON.parse(await readFile(file, "utf8")) as { responseIds: string[]; totalTokens: number };
     expect(persisted).toMatchObject({ responseIds: ["evren_1"], totalTokens: 10 });
+  });
+
+  it("preserves legacy daily totals as unclassified and never double-counts classified usage", async () => {
+    const temp = await mkdtemp(path.join(os.tmpdir(), "evren-usage-legacy-"));
+    const tracker = new UsageTracker(new UsagePersistence(temp), () => new Date("2026-09-21T12:00:00+03:00"));
+    const file = path.join(temp, "usage-2026-09-21.json");
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(file, JSON.stringify({
+      date: "2026-09-21",
+      inputTokens: 7,
+      outputTokens: 3,
+      totalTokens: 10,
+      responseIds: ["legacy"],
+      updatedAt: "2026-09-21T00:00:00.000Z",
+    }), "utf8");
+    await tracker.initialize();
+    expect(tracker.snapshot().classified?.unclassified.totalTokens).toBe(10);
+    expect(await tracker.record("evren_internal", { inputTokens: 4, outputTokens: 1, totalTokens: 5 }, "internal"))
+      .toBe(true);
+    expect(await tracker.record("evren_internal", { inputTokens: 4, outputTokens: 1, totalTokens: 5 }, "internal"))
+      .toBe(false);
+    expect(tracker.snapshot()).toMatchObject({
+      totalTokens: 15,
+      classified: {
+        internal: { totalTokens: 5 },
+        unclassified: { totalTokens: 10 },
+      },
+    });
   });
 });

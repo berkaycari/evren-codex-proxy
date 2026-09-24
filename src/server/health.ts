@@ -4,6 +4,7 @@ import type { PricingGuard } from "../safety/pricing-guard.js";
 import type { SessionStore } from "../sessions/store.js";
 import type { UsageTracker } from "../usage/tracker.js";
 import type { EvrenCreditState } from "../evren/client.js";
+import type { UpdateCheckState } from "../update/checker.js";
 
 export function registerHealthRoute(
   app: FastifyInstance,
@@ -13,6 +14,7 @@ export function registerHealthRoute(
     sessions: SessionStore;
     usage: UsageTracker;
     credits?: { getCreditState(): EvrenCreditState };
+    updateCheck?: { getState(): UpdateCheckState };
   },
 ): void {
   app.get("/health", async () => {
@@ -20,6 +22,7 @@ export function registerHealthRoute(
     const daily = deps.usage.snapshot();
     const session = deps.sessions.getLatest();
     const credits = deps.credits?.getCreditState() ?? { uncertain: false };
+    const update = deps.updateCheck?.getState() ?? { status: "disabled" as const };
     return {
       status: pricing.allowed && daily.accountingCertain ? "online" : "blocked",
       listen: `${deps.config.host}:${deps.config.port}`,
@@ -40,15 +43,30 @@ export function registerHealthRoute(
         uncertain: credits.uncertain,
         updated_at: credits.updatedAt ?? null,
       },
+      update: {
+        status: update.status,
+        checked_at: update.checkedAt ?? null,
+        available_version: update.updateAvailableVersion ?? null,
+      },
       usage: {
         daily,
         session: session ? {
-          id: session.id,
           requests: session.requestCount,
           tool_calls: session.toolCallCount,
+          inferences: session.inferenceCount,
           input_tokens: session.usage.inputTokens,
           output_tokens: session.usage.outputTokens,
           total_tokens: session.usage.totalTokens,
+          classified: session.usageByClass,
+          polling: {
+            active: session.polling.active !== undefined,
+            current_consecutive_polls: session.polling.active?.consecutivePolls ?? 0,
+            current_authoritative_tokens: session.polling.active?.authoritativeTokensSpent ?? 0,
+            total_poll_inferences: session.polling.totalPollInferences,
+            total_authoritative_tokens: session.polling.totalAuthoritativeTokens,
+          },
+          output_budget_saturated: session.lastOutputBudgetSaturated,
+          output_budget_saturation_count: session.outputBudgetSaturationCount,
           created_at: session.createdAt.toISOString(),
           last_activity: session.lastActivity.toISOString(),
         } : null,

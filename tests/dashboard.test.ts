@@ -3,10 +3,14 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
+  buildHelpLines,
   buildDashboardLines,
   Dashboard,
   deriveDashboardStage,
   formatLocalTime,
+  parseDashboardKeys,
+  type DashboardConfigurationRequest,
+  type DashboardInput,
   type DashboardSnapshot,
   type DashboardTerminal,
 } from "../src/ui/dashboard.js";
@@ -17,7 +21,7 @@ const snapshot: DashboardSnapshot = {
   listen: "127.0.0.1:8787",
   model: "deepseek-v4.1-flash",
   transport: "native",
-  version: "1.1.0",
+  version: "1.2.0",
   pricing: {
     allowed: true,
     connected: true,
@@ -32,7 +36,16 @@ const snapshot: DashboardSnapshot = {
     totalTokens: 0,
     accountingCertain: true,
   },
-  limits: { requests: 100, sessionTokens: 1_000, dailyTokens: 10_000_000, toolCalls: 20 },
+  limits: {
+    requests: 100,
+    sessionTokens: 1_000,
+    dailyTokens: 10_000_000,
+    toolCalls: 20,
+    outputTokens: 4_096,
+    pollWarning: 3,
+    pollHardCap: 0,
+  },
+  preset: "Custom/current",
   lastAction: "WAITING",
 };
 
@@ -58,6 +71,36 @@ describe("dashboard", () => {
 
     expect(lines).toHaveLength(8);
     expect(lines.every((line) => stripAnsi(line).length <= 12)).toBe(true);
+  });
+
+  it("parses only F1 for Help plus configuration navigation and raw Ctrl+C", () => {
+    expect(parseDashboardKeys("\u001bOP")).toEqual(["help"]);
+    expect(parseDashboardKeys("\u001b[11~")).toEqual(["help"]);
+    expect(parseDashboardKeys("?Hh")).toEqual([]);
+    expect(parseDashboardKeys("\u001b[A\u001b[B\r")).toEqual(["up", "down", "enter"]);
+    expect(parseDashboardKeys("\r\n")).toEqual(["enter"]);
+    expect(parseDashboardKeys("\u001bBbCc\u0003")).toEqual([
+      "back", "back", "back", "configure", "configure", "interrupt",
+    ]);
+  });
+
+  it("renders compact second-terminal instructions and effective configuration without secrets", () => {
+    const rendered = stripAnsi(buildHelpLines(snapshot, { columns: 72, rows: 30 }).join("\n"));
+
+    expect(rendered).toContain("EVREN CODEX BRIDGE — YARDIM");
+    expect(rendered).toContain("HIZLI BAŞLANGIÇ");
+    expect(rendered).toContain("İkinci bir terminal açın");
+    expect(rendered).toContain("cd <proje-klasoru>");
+    expect(rendered).toContain("codex --profile evren");
+    expect(rendered).toContain("Codex terminaline yazın; bu panele yazmayın");
+    expect(rendered).toContain("environment > config/local.json > config/defaults.json");
+    expect(rendered).toContain("STANDART");
+    expect(rendered).toContain("KODLAMA");
+    expect(rendered).toContain("3000000 / 120 / 140");
+    expect(rendered).toContain("ÖZEL");
+    expect(rendered).toContain("Esc / B   Panele dön        C   Yapılandırma");
+    expect(rendered).not.toContain("EVREN_API_KEY=");
+    expect(rendered.split("\n")).toHaveLength(30);
   });
 
   it("renders UTC event timestamps and freshness with the same local-time formatter", () => {
@@ -103,6 +146,24 @@ describe("dashboard", () => {
     expect(stripAnsi(lines.join("\n"))).toContain("Last —");
   });
 
+  it("keeps an active TOOL stage across pricing refresh and resumes normal transitions", () => {
+    const active = [
+      { timestamp: "2026-09-22T12:00:00.000Z", event: "CODEX_REQUEST" },
+      { timestamp: "2026-09-22T12:00:01.000Z", event: "TOOL_REQUEST" },
+      { timestamp: "2026-09-22T12:00:02.000Z", event: "PRICING_CHECK_OK", detail: "0 CR verified" },
+    ];
+    expect(deriveDashboardStage(active)).toBe("TOOL");
+    expect(deriveDashboardStage([
+      ...active,
+      { timestamp: "2026-09-22T12:00:03.000Z", event: "TOOL_RESULT" },
+    ])).toBe("RESULT");
+    expect(deriveDashboardStage([
+      ...active,
+      { timestamp: "2026-09-22T12:00:03.000Z", event: "TOOL_RESULT" },
+      { timestamp: "2026-09-22T12:00:04.000Z", event: "RESPONSE_FINALIZED" },
+    ])).toBe("FINAL");
+  });
+
   it("shows ERROR as the current and last state", () => {
     const events = [
       { timestamp: "2026-09-22T12:00:00.000Z", event: "CODEX_REQUEST" },
@@ -120,7 +181,7 @@ describe("dashboard", () => {
     const rendered = stripAnsi(lines.join("\n"));
 
     expect(rendered).toContain(`Transport ${transport}`);
-    expect(rendered).toContain("EVREN CODEX BRIDGE · v1.1.0");
+    expect(rendered).toContain("EVREN CODEX BRIDGE · v1.2.0");
   });
 
   it("shows authoritative last usage, pricing metadata, and trusted credits without inventing price units", () => {
@@ -131,7 +192,14 @@ describe("dashboard", () => {
       requestCount: 3,
       inferenceCount: 4,
       usage: { inputTokens: 40_000, outputTokens: 500, totalTokens: 40_500 },
+      usageByClass: {
+        foreground: { inputTokens: 40_000, outputTokens: 500, totalTokens: 40_500 },
+        internal: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        unclassified: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      },
       lastUsage: { inputTokens: 20_731, outputTokens: 184, totalTokens: 20_915 },
+      lastOutputBudgetSaturated: false,
+      outputBudgetSaturationCount: 0,
       toolCallCount: 2,
       transcript: [],
       nativeHistory: [],
@@ -140,6 +208,7 @@ describe("dashboard", () => {
       pendingToolCalls: new Map(),
       completedToolCalls: new Map(),
       tools: new Map(),
+      polling: { totalPollInferences: 0, totalAuthoritativeTokens: 0 },
     };
     const rendered = stripAnsi(buildDashboardLines({
       ...snapshot,
@@ -161,6 +230,53 @@ describe("dashboard", () => {
     expect(rendered).toContain("Remaining 1000.0000 CR");
     expect(rendered).toContain("Last in 20,731 · out 184");
     expect(rendered).not.toMatch(/CR\s*\/\s*(token|1K|1M)/i);
+  });
+
+  it("shows compact active poll usage and an available stable update", () => {
+    const activeSession = {
+      id: "sess_poll",
+      createdAt: new Date(),
+      lastActivity: new Date(),
+      requestCount: 3,
+      inferenceCount: 3,
+      usage: { inputTokens: 72_700, outputTokens: 300, totalTokens: 73_000 },
+      usageByClass: {
+        foreground: { inputTokens: 72_700, outputTokens: 300, totalTokens: 73_000 },
+        internal: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        unclassified: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      },
+      lastOutputBudgetSaturated: false,
+      outputBudgetSaturationCount: 0,
+      toolCallCount: 3,
+      transcript: [],
+      nativeHistory: [],
+      responseIds: new Set<string>(),
+      accountedEvrenResponseIds: new Set<string>(),
+      pendingToolCalls: new Map(),
+      completedToolCalls: new Map(),
+      tools: new Map(),
+      polling: {
+        active: {
+          toolName: "write_stdin",
+          identityHash: "never-rendered",
+          consecutivePolls: 3,
+          authoritativeTokensSpent: 73_000,
+          startedAt: new Date(),
+          lastPollAt: new Date(),
+          warningEmitted: true,
+        },
+        totalPollInferences: 3,
+        totalAuthoritativeTokens: 73_000,
+      },
+    };
+    const rendered = stripAnsi(buildDashboardLines({
+      ...snapshot,
+      session: activeSession,
+      update: { status: "update_available", updateAvailableVersion: "1.2.0" },
+    }, [], { columns: 72, rows: 26 }, Date.now()).join("\n"));
+    expect(rendered).toContain("Polls 3 · 73k tokens");
+    expect(rendered).toContain("Update available  v1.2.0");
+    expect(rendered).not.toContain("never-rendered");
   });
 
   it("colors a successful EVREN response green without changing visible width", () => {
@@ -193,6 +309,204 @@ describe("dashboard", () => {
     expect(terminal.output[1]?.endsWith("\n")).toBe(false);
   });
 
+  it("cycles Turkish Help and arrow-key Coding configuration without extra or duplicate input", async () => {
+    const terminal = fakeTerminal({ isTTY: true, rows: 36 });
+    const input = fakeInput();
+    let dashboard!: Dashboard;
+    const onConfigure = vi.fn().mockImplementation(async (request: DashboardConfigurationRequest) => {
+      expect(request).toEqual({ preset: "Coding" });
+      dashboard.render({
+        ...snapshot,
+        preset: "Coding",
+        limits: {
+          ...snapshot.limits,
+          sessionTokens: 3_000_000,
+          requests: 120,
+          toolCalls: 140,
+        },
+      });
+      return { status: "applied", preset: "Coding" } as const;
+    });
+    dashboard = new Dashboard(
+      { getRecent: () => [] },
+      { terminal, input, onConfigure },
+    );
+
+    dashboard.render(snapshot);
+    dashboard.start();
+    expect(input.listenerCount()).toBe(1);
+    input.emit("?");
+    expect(stripAnsi(terminal.output.at(-1) ?? "")).toContain("Yardım: F1");
+    input.emit("hH");
+    expect(stripAnsi(terminal.output.at(-1) ?? "")).toContain("Yardım: F1");
+    input.emit("\u001bOP");
+    expect(stripAnsi(terminal.output.at(-1) ?? "")).toContain("EVREN CODEX BRIDGE — YARDIM");
+    dashboard.render({ ...snapshot, lastAction: "BACKGROUND_UPDATE" });
+    expect(stripAnsi(terminal.output.at(-1) ?? "")).toContain("EVREN CODEX BRIDGE — YARDIM");
+    input.emit("c");
+    expect(stripAnsi(terminal.output.at(-1) ?? "")).toContain("EVREN CODEX BRIDGE — YAPILANDIRMA");
+    expect(stripAnsi(terminal.output.at(-1) ?? "")).toContain("> Standart");
+    input.emit("\u001b[B");
+    expect(stripAnsi(terminal.output.at(-1) ?? "")).toContain("> Kodlama");
+    input.emit("\u001b[A");
+    expect(stripAnsi(terminal.output.at(-1) ?? "")).toContain("> Standart");
+    input.emit("\u001b[B\r");
+    const preview = stripAnsi(terminal.output.at(-1) ?? "");
+    expect(preview).toContain("KODLAMA PROFİLİ");
+    expect(preview).toContain("Oturum token limiti : 3,000,000");
+    expect(preview).toContain("İstek / oturum      : 120");
+    expect(preview).toContain("Araç / oturum       : 140");
+    expect(preview).toContain("Çıktı / istek       : 4,096");
+    input.emit("\r");
+
+    await vi.waitFor(() => expect(onConfigure).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(stripAnsi(terminal.output.at(-1) ?? "")).toContain("Yapılandırma uygulandı"));
+    expect(input.listenerCount()).toBe(1);
+    expect(input.rawModes).toEqual([true, false, true]);
+    expect(terminal.output.join("").match(/\u001b\[\?1049h/g)).toHaveLength(2);
+    expect(terminal.output.join("").match(/\u001b\[\?1049l/g)).toHaveLength(1);
+    input.emit("\u001b[11~");
+    const updatedHelp = stripAnsi(terminal.output.at(-1) ?? "");
+    expect(updatedHelp).toContain("Profil  Kodlama");
+    expect(updatedHelp).toContain("Oturum 3,000,000");
+    expect(updatedHelp).toContain("İstek 120");
+    input.emit("b");
+    input.emit("\u001bOPc\u001b");
+    expect(onConfigure).toHaveBeenCalledTimes(1);
+    expect(stripAnsi(terminal.output.at(-1) ?? "")).toContain("Yapılandırma iptal edildi");
+
+    dashboard.stop();
+    expect(input.listenerCount()).toBe(0);
+    expect(input.rawModes).toEqual([true, false, true, false]);
+  });
+
+
+  it("edits Custom configuration in the Node raw-mode loop and applies with one Enter", async () => {
+    const terminal = fakeTerminal({ isTTY: true, rows: 36 });
+    const input = fakeInput();
+    const currentCustom = {
+      maxSessionTokens: 800_000,
+      maxDailyTokens: 10_000_000,
+      maxRequestsPerSession: 40,
+      maxToolCallsPerSession: 60,
+      maxEstimatedInputTokensPerCall: 80_000,
+      maxOutputTokensPerCall: 4_096,
+      sessionTtlMinutes: 30,
+      toolOutputMaxChars: 50_000,
+      toolPollWarningThreshold: 3,
+      maxConsecutiveToolPollInferences: 0,
+      pricingRefreshMinutes: 10,
+      requestTimeoutMs: 120_000,
+      updateCheckEnabled: true,
+    };
+    const customSnapshot: DashboardSnapshot = {
+      ...snapshot,
+      customConfiguration: currentCustom,
+    };
+    let dashboard!: Dashboard;
+    const onConfigure = vi.fn().mockImplementation(async (request: DashboardConfigurationRequest) => {
+      expect(request.preset).toBe("Custom");
+      expect(request.customConfiguration).toMatchObject({
+        maxSessionTokens: 1_200_000,
+        maxDailyTokens: 10_000_000,
+        maxRequestsPerSession: 60,
+        maxToolCallsPerSession: 80,
+        maxOutputTokensPerCall: 4_096,
+        updateCheckEnabled: true,
+      });
+      dashboard.render({
+        ...customSnapshot,
+        preset: "Custom",
+        limits: {
+          ...customSnapshot.limits,
+          sessionTokens: 1_200_000,
+          requests: 60,
+          toolCalls: 80,
+        },
+        customConfiguration: request.customConfiguration!,
+      });
+      return { status: "applied", preset: "Custom" } as const;
+    });
+
+    dashboard = new Dashboard(
+      { getRecent: () => [] },
+      { terminal, input, onConfigure },
+    );
+    dashboard.render(customSnapshot);
+    dashboard.start();
+
+    input.emit("\u001bOPc\u001b[B\u001b[B\r");
+    expect(stripAnsi(terminal.output.at(-1) ?? "")).toContain("EVREN CODEX BRIDGE — ÖZEL YAPILANDIRMA");
+
+    input.emit("1200000\r");
+    expect(stripAnsi(terminal.output.at(-1) ?? "")).toContain("Günlük token limiti");
+
+    input.emit("\r");
+    expect(stripAnsi(terminal.output.at(-1) ?? "")).toContain("İstek / oturum");
+
+    input.emit("60\r");
+    expect(stripAnsi(terminal.output.at(-1) ?? "")).toContain("Araç / oturum");
+
+    input.emit("80\r");
+    expect(stripAnsi(terminal.output.at(-1) ?? "")).toContain("Tahmini girdi/istek limiti");
+
+    // Keep the remaining eight numeric values with one Enter each.
+    for (let index = 0; index < 8; index += 1) input.emit("\r");
+
+    const updateField = stripAnsi(terminal.output.at(-1) ?? "");
+    expect(updateField).toContain("Anonim güncelleme denetimi");
+    input.emit("\r");
+
+    const confirmation = stripAnsi(terminal.output.at(-1) ?? "");
+    expect(confirmation).toContain("ÖZEL PROFİLİ");
+    expect(confirmation).toContain("Oturum token limiti : 1,200,000");
+    expect(confirmation).toContain("İstek / oturum      : 60");
+    expect(confirmation).toContain("Araç / oturum       : 80");
+    expect(confirmation).toContain("> Uygula");
+
+    input.emit("\r");
+
+    await vi.waitFor(() => expect(onConfigure).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(stripAnsi(terminal.output.at(-1) ?? "")).toContain("Yapılandırma uygulandı"));
+    expect(input.listenerCount()).toBe(1);
+    expect(input.rawModes).toEqual([true, false, true]);
+
+    dashboard.stop();
+    expect(input.listenerCount()).toBe(0);
+  });
+
+  it("cancels preset selection with Esc and preserves the previous effective snapshot", () => {
+    const terminal = fakeTerminal({ isTTY: true, rows: 36 });
+    const input = fakeInput();
+    const onConfigure = vi.fn();
+    const dashboard = new Dashboard({ getRecent: () => [] }, { terminal, input, onConfigure });
+    dashboard.render(snapshot);
+    dashboard.start();
+
+    input.emit("\u001bOPc\u001b[B\u001b");
+
+    expect(onConfigure).not.toHaveBeenCalled();
+    const rendered = stripAnsi(terminal.output.at(-1) ?? "");
+    expect(rendered).toContain("Yapılandırma iptal edildi");
+    expect(rendered).toContain("0 / 1,000");
+    dashboard.stop();
+  });
+
+  it("routes raw Ctrl+C to shutdown without opening Help", () => {
+    const terminal = fakeTerminal({ isTTY: true });
+    const input = fakeInput();
+    const onInterrupt = vi.fn();
+    const dashboard = new Dashboard({ getRecent: () => [] }, { terminal, input, onInterrupt });
+    dashboard.render(snapshot);
+    dashboard.start();
+
+    input.emit("\u0003");
+
+    expect(onInterrupt).toHaveBeenCalledTimes(1);
+    expect(stripAnsi(terminal.output.at(-1) ?? "")).not.toContain("EVREN CODEX BRIDGE — YARDIM");
+    dashboard.stop();
+  });
+
   it("does not render before start", () => {
     const terminal = fakeTerminal({ isTTY: true });
     const dashboard = new Dashboard({ getRecent: () => [] }, { terminal });
@@ -214,6 +528,20 @@ describe("dashboard", () => {
     dashboard.stop();
 
     expect(terminal.output).toEqual([]);
+  });
+
+  it("keeps a non-TTY input untouched even when dashboard output is a TTY", () => {
+    const terminal = fakeTerminal({ isTTY: true });
+    const input = fakeInput(false);
+    const dashboard = new Dashboard({ getRecent: () => [] }, { terminal, input });
+    dashboard.render(snapshot);
+
+    dashboard.start();
+
+    expect(input.listenerCount()).toBe(0);
+    expect(input.rawModes).toEqual([]);
+    expect(stripAnsi(terminal.output.at(-1) ?? "")).not.toContain("Yardım: F1");
+    dashboard.stop();
   });
 
   it("notifies only on events and keeps secrets and control characters out of recent TUI data", async () => {
@@ -329,6 +657,33 @@ function fakeTerminal(options: { isTTY: boolean; columns?: number; rows?: number
       output.push(chunk);
       return true;
     },
+  };
+}
+
+function fakeInput(isTTY = true): DashboardInput & {
+  rawModes: boolean[];
+  emit(chunk: string): void;
+  listenerCount(): number;
+} {
+  const listeners = new Set<(chunk: string | Buffer) => void>();
+  const rawModes: boolean[] = [];
+  let raw = false;
+  let paused = true;
+  return {
+    isTTY,
+    get isRaw() { return raw; },
+    rawModes,
+    isPaused: () => paused,
+    setRawMode(mode: boolean) {
+      raw = mode;
+      rawModes.push(mode);
+    },
+    resume() { paused = false; },
+    pause() { paused = true; },
+    on(_event, listener) { listeners.add(listener); },
+    off(_event, listener) { listeners.delete(listener); },
+    emit(chunk: string) { for (const listener of listeners) listener(chunk); },
+    listenerCount: () => listeners.size,
   };
 }
 

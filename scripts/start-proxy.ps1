@@ -7,7 +7,7 @@ $ErrorActionPreference = 'Stop'
 # EVREN CODEX BRIDGE - Terminal Theme
 # ─────────────────────────────────────────────────────────────
 
-$Host.UI.RawUI.WindowTitle = 'EVREN CODEX BRIDGE · v1.1.0'
+$Host.UI.RawUI.WindowTitle = 'EVREN CODEX BRIDGE · v1.2.0'
 
 function global:prompt {
     $time = Get-Date -Format 'HH:mm:ss'
@@ -30,7 +30,7 @@ Clear-Host
 Write-Host ''
 Write-Host '╭──────────────────────────────────────────────────────────╮' -ForegroundColor DarkCyan
 Write-Host '│' -NoNewline -ForegroundColor DarkCyan
-Write-Host '             EVREN CODEX BRIDGE · v1.1.0                  ' -NoNewline -ForegroundColor Cyan
+Write-Host '             EVREN CODEX BRIDGE · v1.2.0                  ' -NoNewline -ForegroundColor Cyan
 Write-Host '│' -ForegroundColor DarkCyan
 Write-Host '├──────────────────────────────────────────────────────────┤' -ForegroundColor DarkCyan
 Write-Host '│  LOCAL AI COMPATIBILITY PROXY                            │' -ForegroundColor DarkCyan
