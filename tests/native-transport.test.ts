@@ -47,12 +47,31 @@ function nativeResponse(
   };
 }
 
-function codexMetadata(requestKind: string): Record<string, unknown> {
+function codexMetadata(requestKind: string, threadId = "thread_live_acceptance"): Record<string, unknown> {
   return {
     "x-codex-turn-metadata": JSON.stringify({
       request_kind: requestKind,
-      thread_id: "thread_live_acceptance",
+      thread_id: threadId,
       turn_id: `turn_${requestKind}`,
+    }),
+  };
+}
+
+function codexWindowMetadata(
+  requestKind: string,
+  threadId: string,
+  windowId: string,
+  windowNumber: number,
+  contextWindowId: string,
+): Record<string, unknown> {
+  return {
+    "x-codex-turn-metadata": JSON.stringify({
+      request_kind: requestKind,
+      thread_id: threadId,
+      turn_id: `turn_${requestKind}_${windowNumber}`,
+      window_id: windowId,
+      window_number: windowNumber,
+      context_window_id: contextWindowId,
     }),
   };
 }
@@ -121,7 +140,7 @@ async function fixture(
   });
   const app = buildServer({ config, pricingGuard, sessions, usage, bridge, logger });
   apps.push(app);
-  return { app, client, sessions, usage, events };
+  return { app, client, sessions, usage, events, config };
 }
 
 describe("native Codex to EVREN mapping", () => {
@@ -192,6 +211,20 @@ describe("native Codex to EVREN mapping", () => {
     expect(native.parallel_tool_calls).toBe(false);
     expect(native.max_output_tokens).toBe(4096);
   });
+
+  it("prunes native tool catalogs only for none and an exact named choice", () => {
+    const base = { input: "test", tools: [functionTool, customTool] };
+    const build = (toolChoice: unknown) => buildNativeEvrenRequest(
+      normalizeCodexRequest({ ...base, tool_choice: toolChoice }),
+      [],
+      "deepseek-v4.1-flash",
+      4096,
+    );
+    expect(build("none").tools).toEqual([]);
+    expect(build({ type: "custom", name: "shell" }).tools.map((tool) => tool.name)).toEqual(["shell"]);
+    expect(build("auto").tools.map((tool) => tool.name)).toEqual(["get_current_directory", "shell"]);
+    expect(build("required").tools.map((tool) => tool.name)).toEqual(["get_current_directory", "shell"]);
+  });
 });
 
 describe("native EVREN response parsing", () => {
@@ -233,15 +266,16 @@ describe("native EVREN response parsing", () => {
     ]), tools)).toThrow(/unknown tool/);
   });
 
-  it("selects only the first of multiple function calls in output order", () => {
+  it("parses every valid native function call in output order", () => {
     expect(parseNativeEvrenResponse(nativeResponse([
       { type: "function_call", call_id: "call_1", name: "get_current_directory", arguments: "{}" },
       { type: "function_call", call_id: "call_2", name: "shell", arguments: '{"input":"pwd"}' },
     ]), tools)).toMatchObject({
-      kind: "tool_call",
-      callId: "call_1",
-      name: "get_current_directory",
-      returnedCallCount: 2,
+      kind: "tool_calls",
+      calls: [
+        { callId: "call_1", name: "get_current_directory" },
+        { callId: "call_2", name: "shell" },
+      ],
     });
   });
 
@@ -533,7 +567,7 @@ describe("native bridge lifecycle", () => {
       payload: {
         input: "independent internal helper",
         tools: [],
-        client_metadata: codexMetadata("prewarm"),
+        client_metadata: codexMetadata("prewarm", "thread_internal_helper"),
       },
     });
     const helperSession = sessions.getByResponseId(helper.json().id);
@@ -572,11 +606,11 @@ describe("native bridge lifecycle", () => {
     ]);
     const first = await app.inject({
       method: "POST", url: "/v1/responses",
-      payload: { input: "first independent turn", tools: [], client_metadata: codexMetadata("turn") },
+      payload: { input: "first independent turn", tools: [], client_metadata: codexMetadata("turn", "thread_first") },
     });
     const second = await app.inject({
       method: "POST", url: "/v1/responses",
-      payload: { input: "second independent turn", tools: [], client_metadata: codexMetadata("turn") },
+      payload: { input: "second independent turn", tools: [], client_metadata: codexMetadata("turn", "thread_second") },
     });
     const firstSession = sessions.getByResponseId(first.json().id);
     const secondSession = sessions.getByResponseId(second.json().id);
@@ -585,6 +619,162 @@ describe("native bridge lifecycle", () => {
     expect(firstSession?.requestCount).toBe(1);
     expect(secondSession?.requestCount).toBe(1);
     expect(sessions.getCurrent()).toBe(secondSession);
+  });
+
+  it("keeps one logical session for one thread and rejects conflicting thread/response identities", async () => {
+    const { app, client, sessions } = await fixture([
+      nativeResponse([{ type: "message", role: "assistant", content: [{ type: "output_text", text: "A1" }] }]),
+      nativeResponse([{ type: "message", role: "assistant", content: [{ type: "output_text", text: "A2" }] }]),
+      nativeResponse([{ type: "message", role: "assistant", content: [{ type: "output_text", text: "B1" }] }]),
+    ]);
+    const first = await app.inject({ method: "POST", url: "/v1/responses", payload: {
+      input: "one", client_metadata: codexMetadata("turn", "thread_A"),
+    } });
+    const second = await app.inject({ method: "POST", url: "/v1/responses", payload: {
+      input: "two", client_metadata: codexMetadata("turn", "thread_A"),
+    } });
+    const third = await app.inject({ method: "POST", url: "/v1/responses", payload: {
+      input: "other", client_metadata: codexMetadata("turn", "thread_B"),
+    } });
+    expect(sessions.getByResponseId(first.json().id)).toBe(sessions.getByResponseId(second.json().id));
+    expect(sessions.getByResponseId(third.json().id)).not.toBe(sessions.getByResponseId(first.json().id));
+
+    const conflict = await app.inject({ method: "POST", url: "/v1/responses", payload: {
+      input: "conflict",
+      previous_response_id: first.json().id,
+      client_metadata: codexMetadata("turn", "thread_B"),
+    } });
+    expect(conflict.statusCode).toBe(400);
+    expect(conflict.json().error.code).toBe("conflicting_session_identity");
+    expect(client.requests).toHaveLength(3);
+  });
+
+  it("associates late thread metadata with a unique canonical fallback session", async () => {
+    const { app, sessions } = await fixture([
+      nativeResponse([{ type: "message", role: "assistant", content: [{ type: "output_text", text: "first answer" }] }]),
+      nativeResponse([{ type: "message", role: "assistant", content: [{ type: "output_text", text: "second answer" }] }]),
+    ]);
+    const first = await app.inject({ method: "POST", url: "/v1/responses", payload: { input: "first question" } });
+    const second = await app.inject({ method: "POST", url: "/v1/responses", payload: {
+      input: [
+        { type: "message", role: "user", content: "first question" },
+        { type: "message", role: "assistant", content: "first answer" },
+        { type: "message", role: "user", content: "next question" },
+      ],
+      client_metadata: codexMetadata("turn", "thread_late"),
+    } });
+    expect(sessions.getByResponseId(second.json().id)).toBe(sessions.getByResponseId(first.json().id));
+  });
+
+  it("adopts a successful Codex window replacement without resetting cumulative usage", async () => {
+    const oldContext = `obsolete-${"x".repeat(4_000)}`;
+    const { app, client, sessions, events } = await fixture([
+      nativeResponse([{ type: "message", role: "assistant", content: [{ type: "output_text", text: "old answer" }] }], "evren_old", { input_tokens: 100, output_tokens: 10, total_tokens: 110 }),
+      nativeResponse([{ type: "message", role: "assistant", content: [{ type: "output_text", text: "compact summary" }] }], "evren_compact", { input_tokens: 80, output_tokens: 20, total_tokens: 100 }),
+      nativeResponse([{ type: "function_call", call_id: "call_after_compaction", name: "get_current_directory", arguments: "{}" }], "evren_after", { input_tokens: 30, output_tokens: 5, total_tokens: 35 }),
+      nativeResponse([{ type: "message", role: "assistant", content: [{ type: "output_text", text: "done" }] }], "evren_done", { input_tokens: 20, output_tokens: 5, total_tokens: 25 }),
+    ]);
+    const first = await app.inject({ method: "POST", url: "/v1/responses", payload: {
+      instructions: "keep this developer instruction",
+      input: oldContext,
+      tools: [functionTool],
+      client_metadata: codexWindowMetadata("turn", "thread_compact", "window_1", 1, "context_1"),
+    } });
+    const compact = await app.inject({ method: "POST", url: "/v1/responses", payload: {
+      instructions: "keep this developer instruction",
+      input: [
+        { type: "message", role: "user", content: oldContext },
+        { type: "message", role: "assistant", content: "old answer" },
+      ],
+      tools: [functionTool],
+      client_metadata: codexWindowMetadata("compaction", "thread_compact", "window_1", 1, "context_1"),
+    } });
+    const session = sessions.getByResponseId(compact.json().id)!;
+    const oldHistoryItems = session.nativeHistory.length;
+    expect(session.pendingCompaction).toBeDefined();
+    expect(oldHistoryItems).toBeGreaterThan(2);
+
+    const after = await app.inject({ method: "POST", url: "/v1/responses", payload: {
+      instructions: "keep this developer instruction",
+      input: [
+        { type: "message", role: "user", content: "Compacted conversation summary" },
+        { type: "message", role: "user", content: "use cwd" },
+      ],
+      tools: [functionTool],
+      parallel_tool_calls: true,
+      client_metadata: codexWindowMetadata("turn", "thread_compact", "window_2", 2, "context_2"),
+    } });
+    expect(after.statusCode).toBe(200);
+    expect(session.acceptedCompactionCount).toBe(1);
+    expect(session.usage.totalTokens).toBe(245);
+    expect(JSON.stringify(client.requests[2])).not.toContain("obsolete-");
+    expect(client.requests[2]?.input.filter((item) => item.role === "developer")).toHaveLength(1);
+    expect(session.contextObservability.peakActiveContextBytes).toBeGreaterThan(session.contextObservability.currentActiveContextBytes);
+
+    const completed = await app.inject({ method: "POST", url: "/v1/responses", payload: {
+      input: [{ type: "function_call_output", call_id: "call_after_compaction", output: "C:\\repo" }],
+      tools: [functionTool],
+      parallel_tool_calls: true,
+      client_metadata: codexWindowMetadata("turn", "thread_compact", "window_2", 2, "context_2"),
+    } });
+    expect(completed.statusCode).toBe(200);
+    expect(completed.json().output[0].content[0].text).toBe("done");
+    expect(session.usage.totalTokens).toBe(270);
+    expect(events.some((event) => event.event === "CONTEXT_WINDOW_COMPACTED")).toBe(true);
+    expect(first.statusCode).toBe(200);
+  });
+
+  it("does not erase active history when a compaction inference fails", async () => {
+    const { app, sessions } = await fixture([
+      nativeResponse([{ type: "message", role: "assistant", content: [{ type: "output_text", text: "old" }] }]),
+      new Error("compaction interrupted"),
+    ]);
+    const first = await app.inject({ method: "POST", url: "/v1/responses", payload: {
+      input: "important old context",
+      client_metadata: codexWindowMetadata("turn", "thread_failed_compact", "w1", 1, "c1"),
+    } });
+    const session = sessions.getByResponseId(first.json().id)!;
+    const before = JSON.stringify(session.nativeHistory);
+    const failed = await app.inject({ method: "POST", url: "/v1/responses", payload: {
+      input: [],
+      client_metadata: codexWindowMetadata("compaction", "thread_failed_compact", "w1", 1, "c1"),
+    } });
+    expect(failed.statusCode).toBe(500);
+    expect(session.pendingCompaction).toBeUndefined();
+    expect(JSON.stringify(session.nativeHistory)).toContain("important old context");
+    expect(JSON.stringify(session.nativeHistory)).toContain(JSON.parse(before)[0].content[0].text);
+  });
+
+  it("records a recoverable local limit, makes no blocked inference, and resumes after live raise", async () => {
+    const { app, client, sessions, config } = await fixture([
+      nativeResponse([{ type: "message", role: "assistant", content: [{ type: "output_text", text: "one" }] }]),
+      nativeResponse([{ type: "message", role: "assistant", content: [{ type: "output_text", text: "resumed" }] }]),
+    ], { maxRequestsPerSession: 1 });
+    const metadata = codexMetadata("turn", "thread_recovery");
+    const first = await app.inject({ method: "POST", url: "/v1/responses", payload: { input: "one", client_metadata: metadata } });
+    const blocked = await app.inject({ method: "POST", url: "/v1/responses", payload: { input: "two", client_metadata: metadata } });
+    const session = sessions.getByResponseId(first.json().id)!;
+    expect(blocked.statusCode).toBe(429);
+    expect(blocked.json().error).toMatchObject({
+      code: "usage_limit_exceeded",
+      limit_name: "MAX_REQUESTS_PER_SESSION",
+      current: 1,
+      limit: 1,
+      recoverable: true,
+      recommended: 120,
+    });
+    expect(blocked.json().error.message).toContain("press R");
+    expect(blocked.json().error.message).toContain("no additional EVREN inference was made");
+    expect(client.requests).toHaveLength(1);
+    expect(session.limitRecovery).toMatchObject({ limitName: "MAX_REQUESTS_PER_SESSION", recommended: 120 });
+
+    config.maxRequestsPerSession = 120;
+    const resumed = await app.inject({ method: "POST", url: "/v1/responses", payload: { input: "continue", client_metadata: metadata } });
+    expect(resumed.statusCode).toBe(200);
+    expect(client.requests).toHaveLength(2);
+    expect(sessions.getByResponseId(resumed.json().id)).toBe(session);
+    expect(session.limitRecovery).toBeUndefined();
+    expect(session.requestCount).toBe(2);
   });
 
   it("makes the full multi-tool token-cost structure observable without replay duplication", async () => {
@@ -885,9 +1075,118 @@ describe("native bridge lifecycle", () => {
     expect(events).toContainEqual({
       event: "NATIVE_MULTI_TOOL_SERIALIZED",
       level: "warn",
-      message: "2 calls → serialized to 1",
+      message: "2 calls → serialized to 1 because Codex disabled parallel tool calls.",
       data: { returnedCallCount: 2, selectedTool: "get_current_directory" },
     });
+  });
+
+  it("returns, validates, and completes a native parallel tool batch", async () => {
+    const { app, client, sessions } = await fixture([
+      nativeResponse([
+        { type: "function_call", call_id: "call_parallel_1", name: "get_current_directory", arguments: "{}" },
+        { type: "function_call", call_id: "call_parallel_2", name: "shell", arguments: '{"input":"pwd"}' },
+      ]),
+      nativeResponse([{ type: "message", role: "assistant", content: [{ type: "output_text", text: "parallel complete" }] }]),
+    ]);
+    const first = await app.inject({
+      method: "POST",
+      url: "/v1/responses",
+      payload: { input: "inspect", tools: [functionTool, customTool], parallel_tool_calls: true },
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json().parallel_tool_calls).toBe(true);
+    expect(first.json().output.map((item: { call_id: string }) => item.call_id)).toEqual([
+      "call_parallel_1", "call_parallel_2",
+    ]);
+    const session = sessions.getByResponseId(first.json().id);
+    expect(session?.toolCallCount).toBe(2);
+    expect([...session?.pendingToolCalls.keys() ?? []]).toEqual(["call_parallel_1", "call_parallel_2"]);
+
+    const continued = await app.inject({
+      method: "POST",
+      url: "/v1/responses",
+      payload: {
+        input: [
+          { type: "function_call_output", call_id: "call_parallel_1", output: "C:\\work" },
+          { type: "custom_tool_call_output", call_id: "call_parallel_2", output: "ok" },
+        ],
+        tools: [functionTool, customTool],
+        parallel_tool_calls: true,
+      },
+    });
+    expect(continued.statusCode).toBe(200);
+    expect(continued.json().output[0].content[0].text).toBe("parallel complete");
+    expect(session?.pendingToolCalls.size).toBe(0);
+    expect(session?.completedToolCalls.size).toBe(2);
+    expect(client.requests[1]?.input).toEqual(expect.arrayContaining([
+      { type: "function_call_output", call_id: "call_parallel_1", output: "C:\\work" },
+      { type: "function_call_output", call_id: "call_parallel_2", output: "ok" },
+    ]));
+  });
+
+  it("handles valid partial outputs from one native parallel batch deterministically", async () => {
+    const { app, sessions } = await fixture([
+      nativeResponse([
+        { type: "function_call", call_id: "call_partial_1", name: "get_current_directory", arguments: "{}" },
+        { type: "function_call", call_id: "call_partial_2", name: "get_current_directory", arguments: "{}" },
+      ]),
+      nativeResponse([{ type: "message", role: "assistant", content: [{ type: "output_text", text: "first accepted" }] }]),
+      nativeResponse([{ type: "message", role: "assistant", content: [{ type: "output_text", text: "second accepted" }] }]),
+    ]);
+    const first = await app.inject({ method: "POST", url: "/v1/responses", payload: {
+      input: "two reads", tools: [functionTool], parallel_tool_calls: true,
+    } });
+    const session = sessions.getByResponseId(first.json().id)!;
+    const partial = await app.inject({ method: "POST", url: "/v1/responses", payload: {
+      input: [{ type: "function_call_output", call_id: "call_partial_1", output: "one" }],
+      tools: [functionTool], parallel_tool_calls: true,
+    } });
+    expect(partial.statusCode).toBe(200);
+    expect([...session.pendingToolCalls.keys()]).toEqual(["call_partial_2"]);
+    const final = await app.inject({ method: "POST", url: "/v1/responses", payload: {
+      input: [{ type: "function_call_output", call_id: "call_partial_2", output: "two" }],
+      tools: [functionTool], parallel_tool_calls: true,
+    } });
+    expect(final.statusCode).toBe(200);
+    expect(session.pendingToolCalls.size).toBe(0);
+    expect(session.completedToolCalls.size).toBe(2);
+  });
+
+  it("rejects an over-limit parallel batch without partially committing calls", async () => {
+    const { app, sessions } = await fixture([
+      nativeResponse([
+        { type: "function_call", call_id: "call_limit_1", name: "get_current_directory", arguments: "{}" },
+        { type: "function_call", call_id: "call_limit_2", name: "get_current_directory", arguments: "{}" },
+      ]),
+    ], { maxToolCallsPerSession: 1 });
+    const response = await app.inject({ method: "POST", url: "/v1/responses", payload: {
+      input: "two reads", tools: [functionTool], parallel_tool_calls: true,
+    } });
+    expect(response.statusCode).toBe(429);
+    const session = sessions.getLatest()!;
+    expect(session.toolCallCount).toBe(0);
+    expect(session.pendingToolCalls.size).toBe(0);
+    expect(response.json().error).toMatchObject({
+      limit_name: "MAX_TOOL_CALLS_PER_SESSION",
+      recoverable: true,
+      recommended: 140,
+    });
+  });
+
+  it("streams every item in a native parallel tool batch", async () => {
+    const { app } = await fixture([nativeResponse([
+      { type: "function_call", call_id: "call_stream_1", name: "get_current_directory", arguments: "{}" },
+      { type: "function_call", call_id: "call_stream_2", name: "get_current_directory", arguments: "{}" },
+    ])]);
+    const response = await app.inject({ method: "POST", url: "/v1/responses", payload: {
+      input: "stream both", tools: [functionTool], parallel_tool_calls: true, stream: true,
+    } });
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["content-type"]).toContain("text/event-stream");
+    expect(response.body).toContain("call_stream_1");
+    expect(response.body).toContain("call_stream_2");
+    expect(response.body).toContain('"output_index":1');
+    expect(response.body.match(/event: response\.output_item\.added/g)).toHaveLength(2);
   });
 
   it("blocks the third identical deterministic protocol failure without new inference or usage", async () => {

@@ -15,6 +15,7 @@ import {
   type DashboardTerminal,
 } from "../src/ui/dashboard.js";
 import { SafeLogger } from "../src/ui/logger.js";
+import { SessionStore } from "../src/sessions/store.js";
 
 const snapshot: DashboardSnapshot = {
   status: "ONLINE",
@@ -82,6 +83,82 @@ describe("dashboard", () => {
     expect(parseDashboardKeys("\u001bBbCc\u0003")).toEqual([
       "back", "back", "back", "configure", "configure", "interrupt",
     ]);
+    expect(parseDashboardKeys("Rr")).toEqual(["recover", "recover"]);
+  });
+
+  it("shows limit recovery, applies only its recommended field, and respects environment precedence", async () => {
+    const terminal = fakeTerminal({ isTTY: true, columns: 72, rows: 20 });
+    const input = fakeInput();
+    const session = new SessionStore(60_000).resolve();
+    session.limitRecovery = {
+      limitName: "MAX_SESSION_TOKENS",
+      current: 1_200_000,
+      limit: 1_200_000,
+      recommended: 3_000_000,
+      blockedAt: new Date(),
+      recoverable: true,
+    };
+    const onConfigure = vi.fn();
+    const recoverySnapshot: DashboardSnapshot = {
+      ...snapshot,
+      session,
+      customConfiguration: {
+        maxSessionTokens: 1_200_000,
+        maxDailyTokens: 10_000_000,
+        maxSessionCredits: 0,
+        maxDailyCredits: 0,
+        minCreditsRemaining: 0,
+        maxRequestsPerSession: 60,
+        maxToolCallsPerSession: 80,
+        maxEstimatedInputTokensPerCall: 80_000,
+        maxOutputTokensPerCall: 4_096,
+        sessionTtlMinutes: 30,
+        toolOutputMaxChars: 50_000,
+        toolPollWarningThreshold: 3,
+        maxConsecutiveToolPollInferences: 0,
+        pricingRefreshMinutes: 10,
+        requestTimeoutMs: 120_000,
+        updateCheckEnabled: true,
+      },
+    };
+    const dashboard = new Dashboard({ getRecent: () => [] }, {
+      terminal,
+      input,
+      environment: { MAX_SESSION_TOKENS: "1200000" },
+      onConfigure,
+    });
+    dashboard.render(recoverySnapshot);
+    dashboard.start();
+    const rendered = stripAnsi(terminal.output.at(-1) ?? "");
+    expect(rendered).toContain("LIMIT REACHED");
+    expect(rendered).toContain("[R] Önerilen limiti yükselt → 3,000,000");
+    input.emit("r");
+    expect(onConfigure).not.toHaveBeenCalled();
+    expect(stripAnsi(terminal.output.at(-1) ?? "")).toContain("environment tarafından yönetiliyor");
+    dashboard.stop();
+
+    const liveTerminal = fakeTerminal({ isTTY: true, columns: 72, rows: 20 });
+    const liveInput = fakeInput();
+    const liveConfigure = vi.fn().mockResolvedValue({ status: "applied", preset: "Custom" });
+    const liveDashboard = new Dashboard({ getRecent: () => [] }, {
+      terminal: liveTerminal,
+      input: liveInput,
+      environment: {},
+      onConfigure: liveConfigure,
+    });
+    liveDashboard.render(recoverySnapshot);
+    liveDashboard.start();
+    liveInput.emit("r");
+    expect(liveConfigure).toHaveBeenCalledWith({
+      preset: "Custom",
+      recoveryLimitName: "MAX_SESSION_TOKENS",
+      customConfiguration: {
+        ...recoverySnapshot.customConfiguration!,
+        maxSessionTokens: 3_000_000,
+      },
+    });
+    await Promise.resolve();
+    liveDashboard.stop();
   });
 
   it("renders compact second-terminal instructions and effective configuration without secrets", () => {
@@ -203,6 +280,17 @@ describe("dashboard", () => {
       toolCallCount: 2,
       transcript: [],
       nativeHistory: [],
+      context: { transcript: [], nativeHistory: [], compactionGeneration: 0 },
+      contextObservability: {
+        totalUpstreamPayloadBytes: 0,
+        canonicalHistoryReplayBytes: 0,
+        currentInputBytes: 0,
+        toolCatalogBytes: 0,
+        acceptedToolOutputReplayBytes: 0,
+        currentActiveContextBytes: 0,
+        peakActiveContextBytes: 0,
+      },
+      acceptedCompactionCount: 0,
       responseIds: new Set<string>(),
       accountedEvrenResponseIds: new Set<string>(),
       pendingToolCalls: new Map(),
@@ -224,7 +312,7 @@ describe("dashboard", () => {
       },
     }, [], { columns: 72, rows: 24 }, Date.now()).join("\n"));
 
-    expect(rendered).toContain("Pricing  prompt 0 · completion 0 CR");
+    expect(rendered).toContain("Pricing  FREE · prompt 0 · completion 0 CR");
     expect(rendered).toContain("Free until  2026-11-01");
     expect(rendered).toContain("Credits Held 0.0000 CR");
     expect(rendered).toContain("Remaining 1000.0000 CR");
@@ -250,6 +338,17 @@ describe("dashboard", () => {
       toolCallCount: 3,
       transcript: [],
       nativeHistory: [],
+      context: { transcript: [], nativeHistory: [], compactionGeneration: 0 },
+      contextObservability: {
+        totalUpstreamPayloadBytes: 0,
+        canonicalHistoryReplayBytes: 0,
+        currentInputBytes: 0,
+        toolCatalogBytes: 0,
+        acceptedToolOutputReplayBytes: 0,
+        currentActiveContextBytes: 0,
+        peakActiveContextBytes: 0,
+      },
+      acceptedCompactionCount: 0,
       responseIds: new Set<string>(),
       accountedEvrenResponseIds: new Set<string>(),
       pendingToolCalls: new Map(),
@@ -387,6 +486,9 @@ describe("dashboard", () => {
     const currentCustom = {
       maxSessionTokens: 800_000,
       maxDailyTokens: 10_000_000,
+      maxSessionCredits: 0,
+      maxDailyCredits: 0,
+      minCreditsRemaining: 0,
       maxRequestsPerSession: 40,
       maxToolCallsPerSession: 60,
       maxEstimatedInputTokensPerCall: 80_000,
@@ -450,8 +552,8 @@ describe("dashboard", () => {
     input.emit("80\r");
     expect(stripAnsi(terminal.output.at(-1) ?? "")).toContain("Tahmini girdi/istek limiti");
 
-    // Keep the remaining eight numeric values with one Enter each.
-    for (let index = 0; index < 8; index += 1) input.emit("\r");
+    // Keep the remaining eleven numeric values with one Enter each.
+    for (let index = 0; index < 11; index += 1) input.emit("\r");
 
     const updateField = stripAnsi(terminal.output.at(-1) ?? "");
     expect(updateField).toContain("Anonim güncelleme denetimi");

@@ -39,6 +39,48 @@ export interface SessionPolling {
   totalAuthoritativeTokens: number;
 }
 
+export interface ContextWindowState {
+  windowId?: string;
+  windowNumber?: number;
+  contextWindowId?: string;
+  nativeHistory: NativeEvrenInputItem[];
+  transcript: TranscriptEntry[];
+  compactionGeneration: number;
+}
+
+export interface ContextObservability {
+  totalUpstreamPayloadBytes: number;
+  canonicalHistoryReplayBytes: number;
+  currentInputBytes: number;
+  toolCatalogBytes: number;
+  acceptedToolOutputReplayBytes: number;
+  currentActiveContextBytes: number;
+  peakActiveContextBytes: number;
+}
+
+export type RecoverableLimitName =
+  | "MAX_SESSION_TOKENS"
+  | "MAX_REQUESTS_PER_SESSION"
+  | "MAX_TOOL_CALLS_PER_SESSION";
+
+export interface LimitRecoveryState {
+  limitName: string;
+  current: number;
+  limit: number;
+  recommended?: number;
+  blockedAt: Date;
+  recoverable: boolean;
+  appliedAt?: Date;
+  appliedLimit?: number;
+}
+
+export interface PendingCompaction {
+  requestedAt: Date;
+  windowId?: string;
+  windowNumber?: number;
+  contextWindowId?: string;
+}
+
 export interface CompletedToolCall {
   callId: string;
   toolName: string;
@@ -62,6 +104,7 @@ export interface PreparedToolOutputs {
 
 export interface Session {
   id: string;
+  threadIdentityHash?: string;
   createdAt: Date;
   lastActivity: Date;
   requestCount: number;
@@ -74,6 +117,11 @@ export interface Session {
   toolCallCount: number;
   transcript: TranscriptEntry[];
   nativeHistory: NativeEvrenInputItem[];
+  context: ContextWindowState;
+  contextObservability: ContextObservability;
+  acceptedCompactionCount: number;
+  pendingCompaction?: PendingCompaction;
+  limitRecovery?: LimitRecoveryState;
   responseIds: Set<string>;
   accountedEvrenResponseIds: Set<string>;
   pendingToolCalls: Map<string, PendingToolCall>;
@@ -90,11 +138,16 @@ export class InvalidToolCallSessionError extends Error {
   readonly code = "invalid_request_error";
 }
 
+export class ConflictingSessionIdentityError extends Error {
+  readonly code = "conflicting_session_identity";
+}
+
 export class SessionStore {
   private readonly sessions = new Map<string, Session>();
   private readonly responseToSession = new Map<string, string>();
   private readonly callToSession = new Map<string, string>();
   private readonly completedCallToSession = new Map<string, string>();
+  private readonly threadToSession = new Map<string, string>();
   private currentSessionId: string | undefined;
 
   constructor(
@@ -120,6 +173,8 @@ export class SessionStore {
       return existing;
     }
     const now = this.now();
+    const nativeHistory: NativeEvrenInputItem[] = [];
+    const transcript: TranscriptEntry[] = [];
     const session: Session = {
       id: `sess_${randomUUID().replaceAll("-", "")}`,
       createdAt: now,
@@ -131,8 +186,23 @@ export class SessionStore {
       lastOutputBudgetSaturated: false,
       outputBudgetSaturationCount: 0,
       toolCallCount: 0,
-      transcript: [],
-      nativeHistory: [],
+      transcript,
+      nativeHistory,
+      context: {
+        nativeHistory,
+        transcript,
+        compactionGeneration: 0,
+      },
+      contextObservability: {
+        totalUpstreamPayloadBytes: 0,
+        canonicalHistoryReplayBytes: 0,
+        currentInputBytes: 0,
+        toolCatalogBytes: 0,
+        acceptedToolOutputReplayBytes: 0,
+        currentActiveContextBytes: 0,
+        peakActiveContextBytes: 0,
+      },
+      acceptedCompactionCount: 0,
       responseIds: new Set(),
       accountedEvrenResponseIds: new Set(),
       pendingToolCalls: new Map(),
@@ -142,6 +212,61 @@ export class SessionStore {
     };
     this.sessions.set(session.id, session);
     return session;
+  }
+
+  resolveByThreadId(threadId: string): Session | undefined {
+    this.prune();
+    const sessionId = this.threadToSession.get(threadId);
+    const session = sessionId ? this.sessions.get(sessionId) : undefined;
+    if (!session && sessionId) this.threadToSession.delete(threadId);
+    if (session) session.lastActivity = this.now();
+    return session;
+  }
+
+  associateThread(session: Session, threadId: string): void {
+    const existingSessionId = this.threadToSession.get(threadId);
+    if (existingSessionId && existingSessionId !== session.id) {
+      throw new ConflictingSessionIdentityError("Codex thread identity conflicts with another Bridge session.");
+    }
+    if (session.threadIdentityHash && session.threadIdentityHash !== digestIdentity(threadId)) {
+      throw new ConflictingSessionIdentityError("Bridge session is already associated with a different Codex thread.");
+    }
+    this.threadToSession.set(threadId, session.id);
+    session.threadIdentityHash = digestIdentity(threadId);
+    session.lastActivity = this.now();
+  }
+
+  assertThreadAssociation(session: Session, threadId: string): void {
+    const mapped = this.resolveByThreadId(threadId);
+    if (mapped && mapped.id !== session.id) {
+      throw new ConflictingSessionIdentityError("Codex thread identity conflicts with response or tool continuation identity.");
+    }
+    this.associateThread(session, threadId);
+  }
+
+  replaceActiveContext(
+    session: Session,
+    replacement: {
+      nativeHistory: NativeEvrenInputItem[];
+      transcript: TranscriptEntry[];
+      windowId?: string;
+      windowNumber?: number;
+      contextWindowId?: string;
+    },
+  ): void {
+    session.nativeHistory = replacement.nativeHistory;
+    session.transcript = replacement.transcript;
+    session.context = {
+      nativeHistory: replacement.nativeHistory,
+      transcript: replacement.transcript,
+      compactionGeneration: session.context.compactionGeneration + 1,
+      ...(replacement.windowId === undefined ? {} : { windowId: replacement.windowId }),
+      ...(replacement.windowNumber === undefined ? {} : { windowNumber: replacement.windowNumber }),
+      ...(replacement.contextWindowId === undefined ? {} : { contextWindowId: replacement.contextWindowId }),
+    };
+    session.acceptedCompactionCount += 1;
+    delete session.pendingCompaction;
+    session.lastActivity = this.now();
   }
 
   recordResponse(session: Session, responseId: string): void {
@@ -211,7 +336,11 @@ export class SessionStore {
     return candidates[0];
   }
 
-  prepareIncomingToolOutputs(session: Session, outputs: readonly IncomingToolOutput[]): PreparedToolOutputs {
+  prepareIncomingToolOutputs(
+    session: Session,
+    outputs: readonly IncomingToolOutput[],
+    allowParallel = false,
+  ): PreparedToolOutputs {
     if (outputs.length === 0) {
       throw new InvalidToolCallSessionError("Tool output continuation is missing call_id.");
     }
@@ -255,7 +384,7 @@ export class SessionStore {
       throw new InvalidToolCallSessionError(`Tool output references unknown call_id: ${incoming.callId}`);
     }
 
-    if (pendingOutputs.length > 1) {
+    if (!allowParallel && pendingOutputs.length > 1) {
       throw new InvalidToolCallSessionError(
         `Parallel tool outputs are not supported; received ${pendingOutputs.length} active pending call_ids.`,
       );
@@ -355,6 +484,9 @@ export class SessionStore {
       for (const responseId of session.responseIds) this.responseToSession.delete(responseId);
       for (const callId of session.pendingToolCalls.keys()) this.callToSession.delete(callId);
       for (const callId of session.completedToolCalls.keys()) this.completedCallToSession.delete(callId);
+      for (const [threadId, sessionId] of this.threadToSession) {
+        if (sessionId === id) this.threadToSession.delete(threadId);
+      }
       this.sessions.delete(id);
       if (this.currentSessionId === id) this.currentSessionId = undefined;
       removed += 1;
@@ -365,4 +497,8 @@ export class SessionStore {
 
 function digestToolOutput(output: string): string {
   return createHash("sha256").update(output, "utf8").digest("hex");
+}
+
+function digestIdentity(identity: string): string {
+  return createHash("sha256").update(identity, "utf8").digest("hex");
 }

@@ -21,7 +21,7 @@ export interface NativeEvrenRequest {
   input: NativeEvrenInputItem[];
   tools: NativeEvrenFunctionTool[];
   tool_choice: NativeEvrenToolChoice;
-  parallel_tool_calls: false;
+  parallel_tool_calls: boolean;
   max_output_tokens: number;
   stream: false;
 }
@@ -34,15 +34,32 @@ export function buildNativeEvrenRequest(
   model: string,
   maxOutputTokens: number,
 ): NativeEvrenRequest {
+  const tools = selectToolsForInference(request.toolChoice, request.tools);
   return {
     model,
     input: [...history],
-    tools: request.tools.map(toNativeFunctionTool),
+    tools: tools.map(toNativeFunctionTool),
     tool_choice: translateToolChoice(request.toolChoice, request.tools),
-    parallel_tool_calls: false,
+    parallel_tool_calls: request.parallelToolCalls,
     max_output_tokens: maxOutputTokens,
     stream: false,
   };
+}
+
+export function selectToolsForInference(
+  choice: NormalizedToolChoice,
+  tools: readonly NormalizedTool[],
+): NormalizedTool[] {
+  if (choice === "none") return [];
+  if (typeof choice === "string") return [...tools];
+  const tool = tools.find((candidate) => candidate.name === choice.name);
+  if (!tool) throw new InvalidNativeToolChoiceError(`Named tool_choice references unknown tool: ${choice.name}`);
+  if (tool.kind !== choice.type) {
+    throw new InvalidNativeToolChoiceError(
+      `Named tool_choice kind does not match ${choice.name}: expected ${tool.kind}, received ${choice.type}.`,
+    );
+  }
+  return [tool];
 }
 
 export function toNativeFunctionTool(tool: NormalizedTool): NativeEvrenFunctionTool {

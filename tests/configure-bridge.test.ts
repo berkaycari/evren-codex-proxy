@@ -39,7 +39,7 @@ function run(
 
 describe("configure-bridge presets", () => {
   it("writes the Standard safety preset while preserving unrelated local settings", async () => {
-    const copied = await copiedConfigurator({ maxDailyTokens: 9_000_000, maxOutputTokensPerCall: 2_048, updateCheckEnabled: false });
+    const copied = await copiedConfigurator({ maxDailyTokens: 9_000_000, maxOutputTokensPerCall: 2_048, maxSessionCredits: 12.5, updateCheckEnabled: false });
     const resultPath = path.join(copied.root, "result.json");
     const result = run(copied.script, "Standard", undefined, resultPath);
     expect(result.status, result.stderr).toBe(0);
@@ -52,6 +52,7 @@ describe("configure-bridge presets", () => {
       maxToolCallsPerSession: 80,
       maxOutputTokensPerCall: 4096,
       updateCheckEnabled: false,
+      maxSessionCredits: 12.5,
     });
     expect(JSON.stringify(saved)).not.toMatch(/EVREN_API_KEY|secret|authorization/i);
   });
@@ -66,6 +67,9 @@ describe("configure-bridge presets", () => {
       maxRequestsPerSession: 120,
       maxToolCallsPerSession: 140,
       maxDailyTokens: 10_000_000,
+      maxSessionCredits: 0,
+      maxDailyCredits: 0,
+      minCreditsRemaining: 0,
       maxOutputTokensPerCall: 4096,
       maxEstimatedInputTokensPerCall: 80_000,
     });
@@ -77,6 +81,9 @@ describe("configure-bridge presets", () => {
     const values = {
       maxSessionTokens: 1_200_000,
       maxDailyTokens: 10_000_000,
+      maxSessionCredits: 0,
+      maxDailyCredits: 0,
+      minCreditsRemaining: 0,
       maxRequestsPerSession: 60,
       maxToolCallsPerSession: 80,
       maxEstimatedInputTokensPerCall: 80_000,
@@ -100,7 +107,7 @@ describe("configure-bridge presets", () => {
   it("keeps Custom interactive editing, including polling cap zero support and update opt-out", async () => {
     const copied = await copiedConfigurator();
     const input = [
-      "810000", "9000000", "70000", "4096", "41", "61", "40000",
+      "810000", "9000000", "0", "0", "2.5", "70000", "4096", "41", "61", "40000",
       "4", "0", "45", "15", "90000", "Kapali",
     ].join("\n") + "\n";
     const result = run(copied.script, "Custom", input);
@@ -109,6 +116,9 @@ describe("configure-bridge presets", () => {
     expect(saved).toMatchObject({
       maxSessionTokens: 810_000,
       maxDailyTokens: 9_000_000,
+      maxSessionCredits: 0,
+      maxDailyCredits: 0,
+      minCreditsRemaining: 2.5,
       maxEstimatedInputTokensPerCall: 70_000,
       maxOutputTokensPerCall: 4096,
       maxRequestsPerSession: 41,

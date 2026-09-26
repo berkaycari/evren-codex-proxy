@@ -5,6 +5,9 @@ import { estimateInputTokens } from "./token-estimator.js";
 
 export class LimitExceededError extends Error {
   readonly code = "usage_limit_exceeded";
+  recoverable = false;
+  recommended?: number;
+  inferenceMade = false;
   constructor(
     public readonly limitName: string,
     public readonly current: number,
@@ -47,8 +50,20 @@ export function assertRequestAllowed(
 }
 
 export function assertToolCallAllowed(config: BridgeConfig, session: Session): void {
+  assertToolCallsAllowed(config, session, 1);
+}
+
+export function assertToolCallsAllowed(config: BridgeConfig, session: Session, additionalCalls: number): void {
+  if (!Number.isSafeInteger(additionalCalls) || additionalCalls <= 0) throw new Error("additionalCalls must be positive.");
   if (session.toolCallCount >= config.maxToolCallsPerSession) {
     throw new LimitExceededError("MAX_TOOL_CALLS_PER_SESSION", session.toolCallCount, config.maxToolCallsPerSession);
+  }
+  if (session.toolCallCount + additionalCalls > config.maxToolCallsPerSession) {
+    throw new LimitExceededError(
+      "MAX_TOOL_CALLS_PER_SESSION",
+      session.toolCallCount,
+      config.maxToolCallsPerSession,
+    );
   }
 }
 

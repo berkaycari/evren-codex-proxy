@@ -25,9 +25,11 @@ export function evaluateModelPricing(payload: unknown, model: string): PricingEv
   if (
     typeof raw.prompt_token_price !== "number" ||
     !Number.isFinite(raw.prompt_token_price) ||
+    raw.prompt_token_price < 0 ||
     typeof raw.completion_token_price !== "number" ||
     !Number.isFinite(raw.completion_token_price) ||
-    typeof raw.currency !== "string"
+    raw.completion_token_price < 0 ||
+    raw.currency !== "CR"
   ) {
     return { allowed: false, reason: `Pricing metadata is invalid for ${model}.` };
   }
@@ -39,8 +41,9 @@ export function evaluateModelPricing(payload: unknown, model: string): PricingEv
       ? { freeUntil: freeUntil.trim().slice(0, 100) }
       : {}),
   };
-  if (pricing.promptTokenPrice !== 0 || pricing.completionTokenPrice !== 0 || pricing.currency !== "CR") {
-    return { allowed: false, reason: `Pricing is not exactly 0 CR for ${model}.`, pricing };
-  }
   return { allowed: true, pricing };
+}
+
+export function isPaidPricing(pricing: ModelPricing): boolean {
+  return pricing.promptTokenPrice > 0 || pricing.completionTokenPrice > 0;
 }

@@ -51,7 +51,7 @@ describe("Codex request normalization", () => {
 
     expect(foreground).toMatchObject({ requestKind: "turn", foreground: true });
     expect(helper).toMatchObject({ requestKind: "prewarm", foreground: false });
-    expect(JSON.stringify(foreground)).not.toContain("thread_main");
+    expect(foreground.turnMetadata.threadId).toBe("thread_main");
     expect(JSON.stringify(foreground)).not.toContain("must-not-be-copied");
   });
 
@@ -65,5 +65,41 @@ describe("Codex request normalization", () => {
       input: "future helper",
       client_metadata: { "x-codex-turn-metadata": JSON.stringify({ request_kind: "unknown_internal_kind" }) },
     }).foreground).toBe(false);
+  });
+
+  it("classifies canonical Codex 0.156.1 request kinds without guessing unknown values", () => {
+    const normalize = (request_kind: string) => normalizeCodexRequest({
+      input: "x",
+      client_metadata: { "x-codex-turn-metadata": JSON.stringify({ request_kind }) },
+    });
+    expect(normalize("turn").requestClassification).toBe("foreground");
+    for (const kind of ["prewarm", "compaction", "memory"]) {
+      expect(normalize(kind).requestClassification).toBe("internal");
+    }
+    expect(normalize("compact")).toMatchObject({ requestKind: "compact", requestClassification: "unclassified" });
+    expect(normalize("future_kind")).toMatchObject({ requestKind: "future_kind", requestClassification: "unclassified" });
+  });
+
+  it("validates each typed metadata field independently", () => {
+    const request = normalizeCodexRequest({
+      client_metadata: { "x-codex-turn-metadata": JSON.stringify({
+        request_kind: "turn",
+        session_id: 123,
+        thread_id: "thread_ok",
+        turn_id: false,
+        window_id: "window_ok",
+        window_number: "2",
+        context_window_id: "context_ok",
+        has_changes: "yes",
+        workspaces: [{ private: "not exposed" }],
+      }) },
+    });
+    expect(request.turnMetadata).toEqual({
+      requestKind: "turn",
+      threadId: "thread_ok",
+      windowId: "window_ok",
+      contextWindowId: "context_ok",
+    });
+    expect(JSON.stringify(request)).not.toContain("workspaces");
   });
 });

@@ -2,7 +2,7 @@
 
 EVREN Codex Bridge, OpenAI Codex CLI'yi EVREN'in OpenAI uyumlu Responses API'siyle kullanmak için geliştirilmiş bağımsız bir uyumluluk köprüsüdür. Yerel olarak çalışır, araçların yürütülmesini Codex'in denetiminde tutar ve model çıkarımı için varsayılan olarak `deepseek-v4.1-flash` modelini kullanır.
 
-Bu belge EVREN Codex Bridge `v1.2.0` sürümünü açıklar. Bu sürüm OpenAI Codex CLI `0.156.1` ile test edilmiştir; bu ifade diğer sürümlerin çalışmadığı anlamına gelmez.
+Bu belge EVREN Codex Bridge `v1.3.0` sürümünü açıklar. Uyumluluk hedefi OpenAI Codex CLI `0.156.1` (`rust-v0.156.1`) sürümüdür; bu ifade diğer sürümlerin çalışmadığı anlamına gelmez.
 
 ## Amaç
 
@@ -29,18 +29,21 @@ Varsayılan aktarım yöntemi `native` seçeneğidir. Standart işlev araçları
 - Yerel Responses aktarımı
 - Codex işlev ve özel araç uyumluluğu
 - Sunucu durumuna dayanmayan yerel devamlılık uyarlaması
-- Sıralı araç çağrısı güvenliği
+- Codex izin verdiğinde doğrulanan native paralel araç çağrıları; metin tabanlı geri dönüşte güvenli serileştirme
 - Geçmiş araç çıktılarının yeniden oynatılmasına karşı koruma
 - Kanonik geçmişin yapısal olarak tekilleştirilmesi ve yerel çok turlu devamlılık
-- Beklenmeyen çoklu yerel işlev çağrısı yanıtlarında güvenli ilk çağrı serileştirmesi
+- `thread_id` tabanlı mantıksal oturum kimliği ve çakışan kimliklerde güvenli ret
+- Codex'in kendi `compaction` / pencere geçişini izleyen, eski pencereyi ancak doğrulanmış replacement geçmişi geldiğinde bırakan aktif bağlam yönetimi
+- Kümülatif oturum kullanımı ile aktif model bağlamını ayrı gösteren ölçümler
 - Yinelenen belirlenimci hatalara ve gereksiz token tüketimine karşı devre kesici
-- Hata durumunda güvenli biçimde kapalı kalan fiyatlandırma koruması
+- Geçerli ücretsiz ve pozitif `CR` fiyatlarını kabul eden, eksik/negatif/bozuk fiyat metadata'sında güvenli biçimde kapanan fiyatlandırma koruması
 - EVREN yanıtındaki kesin kullanım verisini esas alan muhasebe
 - Uzun süren `write_stdin` polling dizileri için güvenli sayaç, kesin token görünürlüğü, uyarı ve isteğe bağlı yerel hard cap
 - Sistem talimatı, kanonik geçmiş, kabul edilmiş araç çıktısı geçmişi, araç kataloğu ve geçerli girdi için ayrı sayısal payload ölçümleri
 - Çıktı bütçesi doygunluğu ve güvenilir Codex metadata sınıfları için güvenli tanı olayları
 - Başlangıçta bir kez çalışan, başarısızlığı köprüyü etkilemeyen anonim GitHub sürüm denetimi
 - İstek, oturum, gün ve araç çağrısı sınırları
+- Oturum/istek/araç sınırında yalnızca ulaşılan limiti önerilen değere yükselten, başarısız isteği otomatik yinelemeyen `[R]` kurtarma akışı
 - Yalnızca yerel makinede dinleyen sunucu
 - Gizli bilgileri koruyan yapılandırılmış günlükleme
 - Olay güdümlü canlı TTY gösterge paneli
@@ -85,7 +88,7 @@ Gizli olmayan sayısal sınırlar, `config/defaults.json` içindeki alanlara kar
 ortam değişkeni > config/local.json > config/defaults.json
 ```
 
-`config/local.json`; `maxSessionTokens`, `maxDailyTokens`, `maxRequestsPerSession`, `maxToolCallsPerSession`, `maxEstimatedInputTokensPerCall`, `maxOutputTokensPerCall`, `sessionTtlMinutes`, `toolOutputMaxChars`, `toolPollWarningThreshold`, `maxConsecutiveToolPollInferences`, `pricingRefreshMinutes`, `requestTimeoutMs` ve `updateCheckEnabled` alanlarını destekler. Sayısal alanlar pozitif tam sayı olmalıdır; yalnızca `maxConsecutiveToolPollInferences` için `0` hard cap'i kapatmak anlamına gelir. `updateCheckEnabled` yalnızca boolean kabul eder. Bilinmeyen, geçersiz veya gizli bilgi izlenimi veren bir alan bulunduğunda köprü açık bir hatayla başlatılmaz. Bu dosyaya gizli bilgi yazmayın; `EVREN_API_KEY` ayrı tutulur ve yalnızca işlem ortamından okunur.
+`config/local.json`; `maxSessionTokens`, `maxDailyTokens`, `maxRequestsPerSession`, `maxToolCallsPerSession`, `maxEstimatedInputTokensPerCall`, `maxOutputTokensPerCall`, `sessionTtlMinutes`, `toolOutputMaxChars`, `toolPollWarningThreshold`, `maxConsecutiveToolPollInferences`, `pricingRefreshMinutes`, `requestTimeoutMs`, `maxSessionCredits`, `maxDailyCredits`, `minCreditsRemaining` ve `updateCheckEnabled` alanlarını destekler. Token/istek/araç alanları pozitif tam sayıdır; `maxConsecutiveToolPollInferences` negatif olmayan tam sayıdır. Üç kredi alanı sonlu, negatif olmayan ondalık değer kabul eder ve `0` o denetimi kapatır. Ortam karşılıkları `MAX_SESSION_CREDITS`, `MAX_DAILY_CREDITS` ve `MIN_CREDITS_REMAINING` adlarıdır. `updateCheckEnabled` yalnızca boolean kabul eder. Bilinmeyen, geçersiz veya gizli bilgi izlenimi veren bir alan bulunduğunda köprü açık bir hatayla başlatılmaz. Bu dosyaya gizli bilgi yazmayın; `EVREN_API_KEY` ayrı tutulur ve yalnızca işlem ortamından okunur.
 
 Windows üzerinde ayarları etkileşimli olarak düzenlemek için isteğe bağlı yardımcıyı çalıştırın:
 
@@ -98,6 +101,8 @@ Betik üç preset sunar. Seçimi `↑` / `↓` ile yapın, `Enter` ile onaylayı
 - `Standard`: ana güvenlik limitlerini `maxSessionTokens=1200000`, `maxDailyTokens=10000000`, `maxRequestsPerSession=60`, `maxToolCallsPerSession=80` ve `maxOutputTokensPerCall=4096` değerlerine getirir; diğer desteklenen yerel ayarları korur.
 - `Coding`: uzun coding-agent işleri için ana güvenlik limitlerini `maxSessionTokens=3000000`, `maxDailyTokens=10000000`, `maxRequestsPerSession=120`, `maxToolCallsPerSession=140` ve `maxOutputTokensPerCall=4096` değerlerine getirir; diğer desteklenen yerel ayarları korur.
 - `Custom`: izin verilen alanların mevcut etkileşimli düzenleme akışını açar.
+
+`Standard` ve `Coding`, mevcut kredi ayarlarını değiştirmez. EVREN'in katalog fiyatları için birim/çarpan sözleşmesi bulunmadığından `maxSessionCredits` ve `maxDailyCredits` pozitifken köprü kesin harcama hesabı uydurmaz; çıkarımı `credit_spend_accounting_unavailable` ile engeller. `minCreditsRemaining`, yalnızca geçerli `X-Evren-Credits-Remaining` değeri daha önce alınmışsa sonraki çıkarımları `remaining <= minimum` koşulunda yerel olarak engeller. İlk istekten önce sağlayıcı bakiyesi bilinmiyorsa katı bir preflight garantisi yoktur. Bozuk kredi başlığı sıfır kabul edilmez.
 
 Depo varsayılanları normal/orta büyüklükte işler için `maxSessionTokens=1200000`, `maxRequestsPerSession=60`, `maxToolCallsPerSession=80`, `maxDailyTokens=10000000` ve `maxOutputTokensPerCall=4096` değerlerini kullanır. Preset'ler model yeteneğini veya model context window'unu değiştirmez; yalnızca yerel güvenlik sınırlarını değiştirir. `Enter` tuşu geçerli değeri korur. Betik yalnızca `config/local.json` dosyasını atomik olarak yazar; köprünün normal başlangıcı bu betiği çalıştırmaz.
 
@@ -137,6 +142,8 @@ Köprü terminalini açık bırakın. Canlı TTY gösterge panelinde yalnızca `
 
 Yardım içindeki `C`, yapılandırmayı açar. Preseti `↑` / `↓` ile seçip `Enter` ile onaylayın; `Standard` ve `Coding` özeti yine `↑` / `↓` ile seçilen `Uygula` / `Vazgeç` adımıyla kesinleşir. İşlem uygulandığında, iptal edildiğinde veya güvenli biçimde başarısız olduğunda terminal otomatik olarak dashboard'a döner. Normal/hafif işler için `Standard`, daha büyük coding-agent işleri için `Coding`, tüm desteklenen gizli olmayan alanları bilinçli biçimde düzenlemek için `Custom` kullanın. `Coding`, model yeteneğini veya varsayılan `maxOutputTokensPerCall=4096` değerini artırmaz.
 
+`MAX_SESSION_TOKENS`, `MAX_REQUESTS_PER_SESSION` veya `MAX_TOOL_CALLS_PER_SESSION` sınırına yerel olarak ulaşıldığında dashboard `LIMIT REACHED` görünümüne geçer. `[R]` yalnızca ulaşılan sınırı önerilen değere yükseltir; `[F1 → C]` özel yapılandırmayı açar. Ortam değişkeni etkin değeri yönetiyorsa `[R]` başarı taklidi yapmaz ve ilgili değişkeni bildirir. Başarısız Codex isteği açık tutulmaz veya otomatik yeniden gönderilmez: ayarı değiştirdikten sonra Codex terminaline dönüp aynı göreve açıkça devam edin.
+
 Köprü şu uç noktaları sunar:
 
 - `GET /health` — güvenli fiyatlandırma, bağlantı ve kullanım özeti
@@ -169,13 +176,29 @@ v1.2 sürüm kabulünün ikinci canlı coding-agent senaryosunda Codex, `deepsee
 
 Bu daha ağır coding-agent çalışması aynı Codex oturumunda `70` istek, `66` araç çağrısı ve `2.578.972` kesin oturum token'ı ile tamamlandı; final yanıtta son kesin kullanım `52.412` girdi ve `812` çıktı token'ı olarak raporlandı. Test sırasında daha düşük bir geçici oturum tavanına güvenli biçimde ulaşıldı; yerel Custom güvenlik sınırı yükseltildikten sonra aynı proje durumu korunarak çalışma tamamlandı. Bu gözlem, oturum tavanının model context window'u değil, köprünün kümülatif yerel güvenlik sınırı olduğunu da pratikte doğrular.
 
-Köprü, TTY ortamında yalnızca gerçek köprü durumunu gösteren alternatif ekranlı bir gösterge paneli açar. Panel; bağlantıyı, seçili aktarım yöntemini, modeli, fiyatlandırmayı, kredi başlıklarını, istek/çıkarım/araç/token sayaçlarını, etkin poll dizisini, geçerli `FLOW` aşamasını, son kesin girdi/çıktı kullanımını ve gizli bilgileri koruyan etkinlik akışını gösterir. `FLOW`, gerçek olaylara göre `READY → CODEX → EVREN → TOOL → RESULT → FINAL` sırasıyla ilerler; hatalar `ERROR` olarak gösterilir. Periyodik fiyat yenilemesi etkin bir `TOOL`, `CODEX` veya `EVREN` aşamasını `READY` ile ezmez. `Last` değeri EVREN yanıtındaki kesin `input_tokens` ve `output_tokens` alanlarından gelir. İstek öncesindeki `≈` değerler yalnızca güvenlik denetiminde kullanılan tahminlerdir.
+#### v1.3.0 aynı-prompt Snake çalışması
 
-`EVREN_USAGE` olayları toplam payload boyutuna ek olarak talimat, kanonik geçmiş, kabul edilmiş araç çıktısı geçmişi, geçerli girdi ve araç kataloğu byte değerlerini ayrı verir. Native aktarım stateless üst hizmete her çıkarımda tam geçerli araç kataloğunu göndermek zorundadır; v1.2 bu katalogdan tahmine dayalı araç çıkarmaz ve kayıplı geçmiş sıkıştırması yapmaz. `foreground` ve `internal` sınıfları yalnızca Codex'in tanınan `request_kind` metadata değeriyle atanır; kanıt yoksa kullanım `unclassified` kalır. Günlük kesin toplam tüm ayrı oturumları içerir ve sınıflandırma toplamı bunun üzerine ikinci kez eklenmez.
+![EVREN Codex Bridge v1.3.0 Snake coding-agent kabul testi](docs/evren-v1.3-snake-acceptance.png)
+
+v1.3.0 release-candidate üzerinde aynı Snake görev istemi `deepseek-v4.1-flash` ile yeniden çalıştırıldı. Codex responsive Türkçe Snake uygulamasını tamamladı; `22/22` uygulama testi geçti, production build başarıyla alındı ve uygulamanın tarayıcıda açıldığı ayrıca doğrulandı. Bridge oturumu `34` istek, `34` inference, `33` araç çağrısı ve `925.164` kesin oturum token'ı ile tamamlandı. Son EVREN çağrısı `33.533` girdi ve `1.106` çıktı token'ı kullandı; dashboard yaklaşık `40K` aktif bağlam gösterdi ve bu çalışmada compaction tetiklenmedi.
+
+| Snake çalışması | Oturum token'ı | İstek | Inference | Araç çağrısı |
+| --- | ---: | ---: | ---: | ---: |
+| v1.2.0 | 2.578.972 | 70 | 70 | 66 |
+| v1.3.0 | 925.164 | 34 | 34 | 33 |
+| Gözlenen fark | -1.653.808 (-%64,1) | -36 (-%51,4) | -36 (-%51,4) | -33 (-%50,0) |
+
+İstem aynı olsa da bu iki canlı agent koşusu tamamen deterministik bir laboratuvar benchmarkı değildir: model/araç kararları değişebilir ve v1.2 çalışmasında geçici `1.800.000` oturum sınırına ulaşılıp daha sonra limit yükseltilmişti. Bu nedenle tablo, v1.3'ün tek başına `%64,1` performans artışı sağladığı şeklinde yorumlanmamalıdır. Buna rağmen aynı görev istemindeki gözlenen kümülatif kullanım, istek ve araç çağrısı farkı release acceptance kaydı olarak saklanır. Bu v1.3 koşusunda compaction sayısının `0` olması nedeniyle compaction sonrası aktif-history replacement davranışı ayrıca manuel kabul senaryosunda doğrulanmalıdır.
+
+Köprü, TTY ortamında yalnızca gerçek köprü durumunu gösteren alternatif ekranlı bir gösterge paneli açar. Panel; bağlantıyı, seçili aktarım yöntemini, modeli, `FREE`/`PAID` fiyat durumunu, kredi başlıklarını, istek/çıkarım/araç/token sayaçlarını, etkin poll dizisini, kümülatif oturum token'ını, yaklaşık aktif bağlamı, kabul edilmiş compaction sayısını, geçerli `FLOW` aşamasını ve son kesin girdi/çıktı kullanımını gösterir. Kümülatif oturum token'ı yerel güvenlik muhasebesidir; model context window'u değildir. `FLOW`, gerçek olaylara göre `READY → CODEX → EVREN → TOOL → RESULT → FINAL` sırasıyla ilerler; hatalar `ERROR` olarak gösterilir. Periyodik fiyat yenilemesi etkin bir `TOOL`, `CODEX`, `EVREN` veya limit-kurtarma durumunu ezmez. `Last` değeri EVREN yanıtındaki kesin `input_tokens` ve `output_tokens` alanlarından gelir. `≈` işaretli aktif bağlam değeri UTF-8 byte tabanlı yerel tahmindir.
+
+`EVREN_USAGE` olayları toplam payload boyutuna ek olarak talimat, kanonik geçmiş, kabul edilmiş araç çıktısı geçmişi, geçerli girdi ve araç kataloğu byte değerlerini ayrı verir. Oturum toplamları; toplam upstream payload, tekrar oynatılan kanonik geçmiş, geçerli girdi, araç kataloğu, araç çıktısı geçmişi ve tepe/aktif bağlam byte değerlerini saklar. Replay payı kesin token israfı değil, `history bytes / total measured payload bytes` tanısıdır. Native aktarımda `tool_choice=none` katalog göndermez; adlandırılmış seçim yalnızca tam eşleşen aracı gönderir; `auto` ve `required` tam kataloğu korur. Tahmine dayalı araç seçimi yapılmaz.
+
+Codex `request_kind=compaction` isteği tek başına geçmişi silmez. Başarılı compaction sonrasında aynı `thread_id` için doğrulanmış yeni `window_id`, `window_number` veya `context_window_id` ve canonical replacement girdi geldiğinde aktif bağlam deterministik olarak yeniden kurulur; eski pencere sonraki EVREN payload'larından çıkarılır. Kümülatif kullanım ve günlük muhasebe sıfırlanmaz. `turn` foreground; `prewarm`, `compaction` ve `memory` internal; bilinmeyen değerler `unclassified` olarak kalır.
 
 EVREN'in kesin `output_tokens` değeri yapılandırılmış `maxOutputTokensPerCall` değerine eşit veya ondan büyükse `OUTPUT_BUDGET_SATURATED` uyarısı oluşur. Bu yalnızca doygunluk kanıtıdır; yanıt otomatik olarak geçersiz ya da kesin kesilmiş sayılmaz. Aynı yanıtta protokol dönüşümü başarısız olursa güvenli hata mesajı bu olası ilişkiyi belirtir. Varsayılan çıktı bütçesi `4096` olarak kalır.
 
-Fiyat satırı, model kataloğundaki `prompt_token_price`, `completion_token_price`, `currency` ve varsa `free_until` değerlerini gösterir. EVREN ayrıca bir fiyat birimi tanımlamadığı için panel token başına ek bir birim varsaymaz. Başarılı çıkarım yanıtlarında alınan geçerli `X-Evren-Credits-Held` ve `X-Evren-Credits-Remaining` değerleri son güvenilir kredi durumu olarak gösterilir; eksik veya geçersiz değerlerin yerinde `—` görünür. Bu başlıklardan istek maliyeti veya zorunlu harcama hesabı türetilmez.
+Fiyat satırı, model kataloğundaki `prompt_token_price`, `completion_token_price`, `currency` ve varsa `free_until` değerlerini gösterir. Her iki fiyat `0 CR` ise `FREE`, geçerli fiyatlardan biri pozitifse `PAID` gösterilir. EVREN ayrıca bir fiyat birimi/çarpanı tanımlamadığı için köprü token fiyatlarından harcama uydurmaz. Başarılı çıkarım yanıtlarında alınan geçerli `X-Evren-Credits-Held` ve `X-Evren-Credits-Remaining` değerleri son güvenilir kredi durumu olarak gösterilir; eksik veya geçersiz değerlerin yerinde `—` görünür. Bu başlıklardan istek maliyeti türetilmez.
 
 Animasyon zamanlayıcısı, benzetilmiş trafik veya yapay token etkinliği yoktur. Görüntü yalnızca köprü durumu değiştiğinde ya da terminal yeniden boyutlandırıldığında yenilenir. TTY dışındaki normal düz günlük çıktısını kullanmak için `NO_DASHBOARD=1` ayarlayın.
 
@@ -228,8 +251,8 @@ Do not report pass unless the tool output proves it.
 ## Güvenlik ve sınırlamalar
 
 - Sunucu yalnızca `127.0.0.1` adresine bağlanır.
-- Başlangıçta ve düzenli aralıklarla yapılan fiyat kontrollerinde, her iki token fiyatı da tam olarak `0 CR` olmadığı sürece köprü güvenli biçimde kapalı kalır.
-- Sıfırdan farklı CR harcama sınırları henüz uygulanmaz. Kredi başlıkları yalnızca görünürlük sağlar ve harcama sınırı olarak kullanılmaz; mevcut sıfır-fiyat koruması bilinçli olarak sürdürülür.
+- Başlangıçta ve düzenli aralıklarla yapılan fiyat kontrolleri sıfır veya pozitif, sonlu ve negatif olmayan `CR` fiyatlarını kabul eder. Eksik, negatif, bozuk veya başka para birimli metadata çıkarımı engeller.
+- Kesin sağlayıcı harcama semantiği olmadığı için oturum/gün kredi bütçeleri pozitifken çıkarım güvenli biçimde engellenir; bu alanlar sessizce yok sayılmaz. Bilinen güvenilir kalan kredi için minimum taban denetimi uygulanabilir.
 - API anahtarları ve bilinen yetkilendirme alanları yapılandırılmış günlüklerde maskelenir.
 - İstemler, araç bağımsız değişkenleri, komutlar, ham araç çıktıları, akıl yürütme içeriği ve bilinmeyen olay üst verileri gösterge paneli etkinlik akışına alınmaz.
 - Eksik veya tutarsız kesin kullanım bilgisi hiçbir zaman sıfır sayılmaz; yeniden başlatılana kadar başka çıkarım yapılması engellenir.
@@ -244,7 +267,7 @@ Geliştirme dönemindeki canlı bütünleştirme testlerinde şunlar gözlemlenm
 
 - EVREN'in yerel standart işlev çağrıları başarıyla tamamlandı.
 - Üst EVREN hizmetinde `previous_response_id` ile devamlılık desteklenmediği için köprü bu alana dayanmaz; konuşmayı yerel kanonik geçmişle sürdürür.
-- EVREN, `parallel_tool_calls=false` gönderildiğinde bile birden fazla yerel işlev çağrısı döndürebilir. Köprü yalnızca ilk çağrıyı güvenli biçimde işler, diğer çağrıları aynı yanıtta yürütmez ve ilk araç sonucundan sonra kararı yeniden EVREN'e bırakır.
+- EVREN, `parallel_tool_calls=false` gönderildiğinde bile birden fazla yerel işlev çağrısı döndürebilir. Bu durumda köprü ilk çağrıyı güvenli biçimde serileştirir. Codex `parallel_tool_calls=true` gönderdiğinde bütün geçerli native çağrılar doğrulanır, tek batch olarak Codex'e döner ve aynı oturumdaki birlikte ya da kısmi çıktılar replay/collision kurallarıyla işlenir. Textual fallback serileştirilmiş kalır.
 - Aynı belirlenimci başarısız isteğin yinelenmesi, gereksiz üst hizmet denemelerini ve token tüketimini sınırlayan yerel bir devre kesiciyle durdurulur.
 - Geçmişte `reasoning_text` yeniden oynatıldığında bir uyumluluk sorunu oluşmuştur.
 - Yerel özel araç tanımlarının gidiş-dönüş aktarımı tutarlı biçimde güvenilir değildir.
@@ -263,6 +286,12 @@ $env:EVREN_TOOL_TRANSPORT = 'textual'
 
 `textual` modu, mevcut katalog ve istem protokolüyle tek düzeltme denemesini korur. Fiyatlandırma, kullanım, oturum veya güvenlik sınırlarını değiştirmez.
 
+## Kontrollü benchmark ve proje yönergeleri
+
+Sabit hesap makinesi ve Snake senaryoları ile kayıt şablonu [`benchmarks/README.md`](benchmarks/README.md) altında bulunur. Sonuçlar yalnızca aynı istem, temiz eşdeğer proje dizini, aynı Codex/model/transport/preset ve eşdeğer paket-cache/ağ koşullarıyla karşılaştırılabilir. Otomatik testler canlı ve yüksek token'lı benchmark çalıştırmaz. v1.3 için verimlilik kanıtı, bir Codex pencere replacement'ından sonra eski pre-compaction geçmişinin sonraki EVREN payload'larında bulunmamasıdır; ölçülmemiş bir yüzde iddiası yapılmaz.
+
+Köprü kullanıcı deposunu taramaz, indekslemez veya kalıcı bir proje bilgi tabanı oluşturmaz. Codex'in kendisi kısa bir `AGENTS.md` dosyasından yararlanabilir. Bu dosyada proje amacı, kısa mimari harita, önemli dizinler, test/build komutları, değişmezler ve taranmaması gereken generated/vendor dizinleri bulunabilir. Devasa bir `AGENTS.md` kalıcı talimat yükünü ve bağlam kullanımını artırır; yalnızca gerçekten gerekli, güncel bilgiyi tutun. Köprü kullanıcı projelerinde bu dosyayı zorla oluşturmaz.
+
 ## Test ve doğrulama
 
 Otomatik kontroller:
@@ -274,7 +303,7 @@ npm.cmd run build
 git diff --check
 ```
 
-Elle sürüm kabulü ayrıca `native` ve `textual` aktarım yöntemlerini, canlı EVREN bağlantısını, normal ve dar terminal genişliklerinde gösterge panelinin `FLOW` akışını ve renklerini, iki araçlı gösterimi, `Ctrl+C` sonrasında terminalin önceki durumuna dönmesini, TTY dışı çıktıyı ve `NO_DASHBOARD=1` davranışını doğrulamalıdır.
+Elle sürüm kabulü ayrıca `native` ve `textual` aktarım yöntemlerini, canlı EVREN bağlantısını, normal ve dar terminal genişliklerinde gösterge panelinin `FLOW` akışını ve renklerini, iki araçlı gösterimi, `Ctrl+C` sonrasında terminalin önceki durumuna dönmesini, TTY dışı çıktıyı ve `NO_DASHBOARD=1` davranışını doğrulamalıdır. v1.3 senaryo adımları [`docs/v1.3-manual-acceptance.md`](docs/v1.3-manual-acceptance.md) dosyasındadır.
 
 Anahtar önceden ayarlanmışsa araç içermeyen isteğe bağlı küçük bir canlı çıkarım testi çalıştırılabilir:
 
@@ -288,7 +317,9 @@ npm.cmd run smoke:evren
 - `/health` çıktısı `blocked` bildiriyor: güvenli fiyatlandırma nedenini ve köprü olay günlüğünü inceleyin.
 - `usage_accounting_uncertain`: EVREN geçerli bir kesin kullanım bilgisi döndürmedi; güvenli biçimde yeniden başlatın ve durum tekrarlanırsa araştırın.
 - `unknown_previous_response_id`: yerel oturumun süresi doldu veya köprü yeniden başlatıldı; yeni bir Codex oturumu başlatın.
-- `usage_limit_exceeded`: yeni bir oturum başlatın, sonraki muhasebe gününü bekleyin veya bilinçli bir sayısal limit geçersiz kılma değeri kullanın.
+- `usage_limit_exceeded`: hızlı kurtarmaya uygun oturum/istek/araç sınırında Bridge terminalindeki `[R]` seçeneğini kullanın veya `F1 → C` ile yalnızca gerekli ayarı değiştirin; sonra Codex terminaline dönüp göreve devam edin. Günlük/tahmini girdi/poll sınırları körlemesine yükseltilmez.
+- `credit_spend_accounting_unavailable`: EVREN kesin kredi harcama birimini sağlamadığı için `maxSessionCredits`/`maxDailyCredits` pozitif değerleri uygulanamaz; güvenli biçimde `0` bırakın veya sağlayıcı sözleşmesini doğrulayın.
+- `minimum_credits_remaining_reached`: son güvenilir kalan kredi yapılandırılmış tabana eşit veya altındadır; otomatik yükseltme yapılmaz.
 - Model kataloğu hatası: sağlayıcı temel URL'sinin tam olarak `http://127.0.0.1:8787/v1` olduğunu doğrulayın.
 - Windows üzerinde `npm.cmd install` sertifika/CA hatası veriyor veya TLS aşamasında takılı görünüyorsa proje terminalinde aşağıdakini deneyebilirsiniz; bu ayar tüm npm sorunlarını çözeceğine dair bir garanti değildir ve köprü çalışma zamanına otomatik eklenmez:
 

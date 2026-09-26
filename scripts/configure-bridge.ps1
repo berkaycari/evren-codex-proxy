@@ -14,6 +14,9 @@ $localPath = Join-Path $projectRoot 'config\local.json'
 $supported = @(
     'maxSessionTokens',
     'maxDailyTokens',
+    'maxSessionCredits',
+    'maxDailyCredits',
+    'minCreditsRemaining',
     'maxRequestsPerSession',
     'maxToolCallsPerSession',
     'maxEstimatedInputTokensPerCall',
@@ -26,6 +29,7 @@ $supported = @(
     'requestTimeoutMs',
     'updateCheckEnabled'
 )
+$decimalSupported = @('maxSessionCredits', 'maxDailyCredits', 'minCreditsRemaining')
 
 function Write-ConfigurationResult {
     param(
@@ -87,6 +91,23 @@ function Read-NonNegativeInteger {
             return $parsed
         }
         Write-Host '0 ile 2147483647 arasında negatif olmayan bir tam sayı girin.' -ForegroundColor Yellow
+    }
+}
+
+function Read-NonNegativeDecimal {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][double]$Current
+    )
+
+    while ($true) {
+        $answer = Read-Host "$Label [$Current]"
+        if ([string]::IsNullOrWhiteSpace($answer)) { return $Current }
+        $parsed = 0.0
+        if ([double]::TryParse($answer.Trim(), [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed) -and $parsed -ge 0 -and -not [double]::IsInfinity($parsed)) {
+            return $parsed
+        }
+        Write-Host '0 veya daha büyük sonlu bir sayı girin; ondalık ayırıcı olarak nokta kullanın.' -ForegroundColor Yellow
     }
 }
 
@@ -178,6 +199,16 @@ function Apply-CustomJson {
             continue
         }
 
+        if ($decimalSupported -contains $key) {
+            if ($property.Value -isnot [ValueType]) { throw "CustomJson value $key must be a finite non-negative number." }
+            $parsedDecimal = [double]$property.Value
+            if ($parsedDecimal -lt 0 -or [double]::IsNaN($parsedDecimal) -or [double]::IsInfinity($parsedDecimal)) {
+                throw "CustomJson value $key must be a finite non-negative number."
+            }
+            $Target[$key] = $parsedDecimal
+            continue
+        }
+
         $parsed = 0L
         $minimum = if ($key -eq 'maxConsecutiveToolPollInferences') { 0 } else { 1 }
         if (-not [long]::TryParse([string]$property.Value, [ref]$parsed) -or $parsed -lt $minimum -or $parsed -gt [int]::MaxValue) {
@@ -203,6 +234,9 @@ function Write-ConfigurationPreview {
     Write-Host ''
     Write-Host ("Oturum token limiti : {0}" -f $Values.maxSessionTokens)
     Write-Host ("Günlük token limiti : {0}" -f $Values.maxDailyTokens)
+    Write-Host ("Oturum kredi limiti : {0}" -f $Values.maxSessionCredits)
+    Write-Host ("Günlük kredi limiti : {0}" -f $Values.maxDailyCredits)
+    Write-Host ("Minimum kalan kredi : {0}" -f $Values.minCreditsRemaining)
     Write-Host ("İstek / oturum      : {0}" -f $Values.maxRequestsPerSession)
     Write-Host ("Araç / oturum       : {0}" -f $Values.maxToolCallsPerSession)
     Write-Host ("Çıktı / istek       : {0}" -f $Values.maxOutputTokensPerCall)
@@ -213,7 +247,13 @@ function Write-ConfigurationPreview {
 $defaults = Read-JsonObject -Path $defaultsPath
 $current = [ordered]@{}
 foreach ($key in $supported) {
-    $current[$key] = if ($key -eq 'updateCheckEnabled') { [bool]$defaults.$key } else { [long]$defaults.$key }
+    $current[$key] = if ($key -eq 'updateCheckEnabled') {
+        [bool]$defaults.$key
+    } elseif ($decimalSupported -contains $key) {
+        [double]$defaults.$key
+    } else {
+        [long]$defaults.$key
+    }
 }
 
 if (Test-Path -LiteralPath $localPath) {
@@ -225,6 +265,14 @@ if (Test-Path -LiteralPath $localPath) {
         if ($property.Name -eq 'updateCheckEnabled') {
             if ($property.Value -isnot [bool]) { throw 'config/local.json value updateCheckEnabled must be true or false.' }
             $current[$property.Name] = [bool]$property.Value
+            continue
+        }
+        if ($decimalSupported -contains $property.Name) {
+            $parsedDecimal = [double]$property.Value
+            if ($parsedDecimal -lt 0 -or [double]::IsNaN($parsedDecimal) -or [double]::IsInfinity($parsedDecimal)) {
+                throw "config/local.json value $($property.Name) must be a finite non-negative number."
+            }
+            $current[$property.Name] = $parsedDecimal
             continue
         }
         $parsed = 0L
@@ -287,6 +335,9 @@ if ($Preset -eq 'Custom') {
     else {
         $current.maxSessionTokens = Read-PositiveInteger 'Oturum token limiti        ' $current.maxSessionTokens
         $current.maxDailyTokens = Read-PositiveInteger 'Günlük token limiti        ' $current.maxDailyTokens
+        $current.maxSessionCredits = Read-NonNegativeDecimal 'Oturum kredi limiti (0 kapatır)' $current.maxSessionCredits
+        $current.maxDailyCredits = Read-NonNegativeDecimal 'Günlük kredi limiti (0 kapatır)' $current.maxDailyCredits
+        $current.minCreditsRemaining = Read-NonNegativeDecimal 'Minimum kalan kredi (0 kapatır)' $current.minCreditsRemaining
         $current.maxEstimatedInputTokensPerCall = Read-PositiveInteger 'Tahmini girdi/istek limiti ' $current.maxEstimatedInputTokensPerCall
         $current.maxOutputTokensPerCall = Read-PositiveInteger 'Çıktı token/istek limiti   ' $current.maxOutputTokensPerCall
         $current.maxRequestsPerSession = Read-PositiveInteger 'İstek / oturum             ' $current.maxRequestsPerSession

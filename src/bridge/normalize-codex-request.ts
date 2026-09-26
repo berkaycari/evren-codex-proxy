@@ -8,19 +8,30 @@ const requestSchema = z.object({
   input: z.unknown().optional(),
   tools: z.unknown().optional(),
   tool_choice: z.unknown().optional(),
+  parallel_tool_calls: z.boolean().optional(),
   previous_response_id: z.string().optional(),
   client_metadata: z.unknown().optional(),
   stream: z.boolean().optional(),
 }).passthrough();
 
-const FOREGROUND_REQUEST_KINDS = new Set(["turn", "review"]);
-const INTERNAL_REQUEST_KINDS = new Set([
-  "compact",
-  "memory",
-  "memory_consolidation",
-  "prewarm",
-  "thread_spawn",
-]);
+const FOREGROUND_REQUEST_KINDS = new Set(["turn"]);
+const INTERNAL_REQUEST_KINDS = new Set(["prewarm", "compaction", "memory"]);
+
+export interface CodexTurnMetadata {
+  requestKind?: string;
+  sessionId?: string;
+  threadId?: string;
+  turnId?: string;
+  windowId?: string;
+  windowNumber?: number;
+  contextWindowId?: string;
+  parentThreadId?: string;
+  parentTurnId?: string;
+  threadSource?: string;
+  turnTrigger?: string;
+  latestGitCommitHash?: string;
+  hasChanges?: boolean;
+}
 
 export interface NormalizedInputEntry {
   role: "user" | "assistant" | "tool";
@@ -35,8 +46,10 @@ export interface NormalizedCodexRequest {
   toolOutputCallIds: string[];
   tools: NormalizedTool[];
   toolChoice: NormalizedToolChoice;
+  parallelToolCalls: boolean;
   previousResponseId?: string;
   requestKind?: string;
+  turnMetadata: CodexTurnMetadata;
   requestClassification: RequestClassification;
   foreground: boolean;
   stream: boolean;
@@ -58,7 +71,8 @@ export function normalizeCodexRequest(body: unknown): NormalizedCodexRequest {
   if (!parsed.success) throw new InvalidRequestError("Request body must be a JSON object with valid field types.");
   const value = parsed.data;
   const entries = normalizeInput(value.input);
-  const requestKind = normalizeRequestKind(value.client_metadata);
+  const turnMetadata = normalizeCodexTurnMetadata(value.client_metadata);
+  const requestKind = turnMetadata.requestKind;
   return {
     ...(value.model === undefined ? {} : { model: value.model }),
     instructions: value.instructions ?? "",
@@ -66,8 +80,10 @@ export function normalizeCodexRequest(body: unknown): NormalizedCodexRequest {
     toolOutputCallIds: entries.flatMap((entry) => entry.role === "tool" && entry.callId ? [entry.callId] : []),
     tools: normalizeTools(value.tools),
     toolChoice: normalizeToolChoice(value.tool_choice),
+    parallelToolCalls: value.parallel_tool_calls ?? false,
     ...(value.previous_response_id === undefined ? {} : { previousResponseId: value.previous_response_id }),
     ...(requestKind === undefined ? {} : { requestKind }),
+    turnMetadata,
     requestClassification: classifyRequest(requestKind),
     foreground: requestKind === undefined ? value.client_metadata === undefined : isForegroundRequest(requestKind),
     stream: value.stream ?? false,
@@ -81,22 +97,50 @@ function classifyRequest(requestKind: string | undefined): RequestClassification
   return "unclassified";
 }
 
-function normalizeRequestKind(clientMetadata: unknown): string | undefined {
-  if (!clientMetadata || typeof clientMetadata !== "object" || Array.isArray(clientMetadata)) return undefined;
+export function normalizeCodexTurnMetadata(clientMetadata: unknown): CodexTurnMetadata {
+  if (!clientMetadata || typeof clientMetadata !== "object" || Array.isArray(clientMetadata)) return {};
   const encoded = (clientMetadata as Record<string, unknown>)["x-codex-turn-metadata"];
-  if (typeof encoded !== "string") return undefined;
+  if (typeof encoded !== "string") return {};
   try {
     const metadata = JSON.parse(encoded) as unknown;
-    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return undefined;
-    const requestKind = (metadata as Record<string, unknown>).request_kind;
-    if (typeof requestKind !== "string") return undefined;
-    const normalized = requestKind.trim();
-    return FOREGROUND_REQUEST_KINDS.has(normalized) || INTERNAL_REQUEST_KINDS.has(normalized)
-      ? normalized
-      : undefined;
+    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return {};
+    const record = metadata as Record<string, unknown>;
+    const requestKind = optionalTrimmedString(record.request_kind);
+    return {
+      ...(requestKind === undefined ? {} : { requestKind }),
+      ...optionalStringField(record, "session_id", "sessionId"),
+      ...optionalStringField(record, "thread_id", "threadId"),
+      ...optionalStringField(record, "turn_id", "turnId"),
+      ...optionalStringField(record, "window_id", "windowId"),
+      ...(Number.isSafeInteger(record.window_number) && (record.window_number as number) >= 0
+        ? { windowNumber: record.window_number as number }
+        : {}),
+      ...optionalStringField(record, "context_window_id", "contextWindowId"),
+      ...optionalStringField(record, "parent_thread_id", "parentThreadId"),
+      ...optionalStringField(record, "parent_turn_id", "parentTurnId"),
+      ...optionalStringField(record, "thread_source", "threadSource"),
+      ...optionalStringField(record, "turn_trigger", "turnTrigger"),
+      ...optionalStringField(record, "latest_git_commit_hash", "latestGitCommitHash"),
+      ...(typeof record.has_changes === "boolean" ? { hasChanges: record.has_changes } : {}),
+    };
   } catch {
-    return undefined;
+    return {};
   }
+}
+
+function optionalStringField(
+  record: Record<string, unknown>,
+  source: string,
+  target: keyof CodexTurnMetadata,
+): Partial<CodexTurnMetadata> {
+  const value = optionalTrimmedString(record[source]);
+  return value === undefined ? {} : { [target]: value } as Partial<CodexTurnMetadata>;
+}
+
+function optionalTrimmedString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 && trimmed.length <= 1_000 ? trimmed : undefined;
 }
 
 function isForegroundRequest(requestKind: string | undefined): boolean {

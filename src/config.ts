@@ -13,6 +13,9 @@ export interface BridgeConfig {
   toolTransport: "native" | "textual";
   maxSessionTokens: number;
   maxDailyTokens: number;
+  maxSessionCredits: number;
+  maxDailyCredits: number;
+  minCreditsRemaining: number;
   maxRequestsPerSession: number;
   maxToolCallsPerSession: number;
   maxEstimatedInputTokensPerCall: number;
@@ -42,6 +45,12 @@ const ENV_NUMBERS: Record<string, keyof BridgeConfig> = {
   EVREN_REQUEST_TIMEOUT_MS: "requestTimeoutMs",
 };
 
+const ENV_NON_NEGATIVE_DECIMALS: Record<string, keyof BridgeConfig> = {
+  MAX_SESSION_CREDITS: "maxSessionCredits",
+  MAX_DAILY_CREDITS: "maxDailyCredits",
+  MIN_CREDITS_REMAINING: "minCreditsRemaining",
+};
+
 const LOCAL_NUMBER_KEYS = [
   "maxSessionTokens",
   "maxDailyTokens",
@@ -60,8 +69,15 @@ const LOCAL_NON_NEGATIVE_NUMBER_KEYS = [
   "maxConsecutiveToolPollInferences",
 ] as const satisfies ReadonlyArray<keyof BridgeConfig>;
 
+const LOCAL_NON_NEGATIVE_DECIMAL_KEYS = [
+  "maxSessionCredits",
+  "maxDailyCredits",
+  "minCreditsRemaining",
+] as const satisfies ReadonlyArray<keyof BridgeConfig>;
+
 const localNumberKeys = new Set<string>(LOCAL_NUMBER_KEYS);
 const localNonNegativeNumberKeys = new Set<string>(LOCAL_NON_NEGATIVE_NUMBER_KEYS);
+const localNonNegativeDecimalKeys = new Set<string>(LOCAL_NON_NEGATIVE_DECIMAL_KEYS);
 
 export function loadConfig(
   env: NodeJS.ProcessEnv = process.env,
@@ -73,10 +89,21 @@ export function loadConfig(
   for (const [envName, key] of Object.entries(ENV_NUMBERS)) {
     const raw = env[envName];
     if (raw === undefined) continue;
+    if (raw.trim().length === 0) throw new Error(`${envName} must be a positive integer.`);
     const parsed = Number(raw);
     const nonNegative = key === "maxConsecutiveToolPollInferences";
     if (!Number.isSafeInteger(parsed) || (nonNegative ? parsed < 0 : parsed <= 0)) {
       throw new Error(`${envName} must be a ${nonNegative ? "non-negative" : "positive"} integer.`);
+    }
+    (config as unknown as Record<string, number>)[key] = parsed;
+  }
+  for (const [envName, key] of Object.entries(ENV_NON_NEGATIVE_DECIMALS)) {
+    const raw = env[envName];
+    if (raw === undefined) continue;
+    if (raw.trim().length === 0) throw new Error(`${envName} must be a finite non-negative number.`);
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      throw new Error(`${envName} must be a finite non-negative number.`);
     }
     (config as unknown as Record<string, number>)[key] = parsed;
   }
@@ -128,8 +155,15 @@ function readLocalConfig(path: string): Partial<BridgeConfig> {
       result.updateCheckEnabled = raw;
       continue;
     }
-    if (!localNumberKeys.has(key) && !localNonNegativeNumberKeys.has(key)) {
+    if (!localNumberKeys.has(key) && !localNonNegativeNumberKeys.has(key) && !localNonNegativeDecimalKeys.has(key)) {
       throw new Error(`Unsupported local configuration key: ${key}. Secrets and runtime endpoints are not allowed.`);
+    }
+    if (localNonNegativeDecimalKeys.has(key)) {
+      if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0) {
+        throw new Error(`Local configuration value ${key} must be a finite non-negative number.`);
+      }
+      (result as Record<string, number>)[key] = raw;
+      continue;
     }
     const nonNegative = localNonNegativeNumberKeys.has(key);
     if (!Number.isSafeInteger(raw) || (nonNegative ? (raw as number) < 0 : (raw as number) <= 0)) {

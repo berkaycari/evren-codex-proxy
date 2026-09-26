@@ -11,6 +11,9 @@ describe("local bridge configuration", () => {
     await writeFile(localConfigPath, JSON.stringify({
       maxSessionTokens: 123_456,
       maxDailyTokens: 654_321,
+      maxSessionCredits: 12.5,
+      maxDailyCredits: 25.75,
+      minCreditsRemaining: 2.25,
       maxRequestsPerSession: 25,
       maxToolCallsPerSession: 50,
       maxEstimatedInputTokensPerCall: 70_000,
@@ -24,11 +27,14 @@ describe("local bridge configuration", () => {
       updateCheckEnabled: false,
     }), "utf8");
 
-    const config = loadConfig({ MAX_SESSION_TOKENS: "222222" }, { localConfigPath });
+    const config = loadConfig({ MAX_SESSION_TOKENS: "222222", MIN_CREDITS_REMAINING: "3.5" }, { localConfigPath });
 
     expect(config).toMatchObject({
       maxSessionTokens: 222_222,
       maxDailyTokens: 654_321,
+      maxSessionCredits: 12.5,
+      maxDailyCredits: 25.75,
+      minCreditsRemaining: 3.5,
       maxRequestsPerSession: 25,
       maxToolCallsPerSession: 50,
       maxEstimatedInputTokensPerCall: 70_000,
@@ -81,6 +87,7 @@ describe("local bridge configuration", () => {
     ["unsafe integer", JSON.stringify({ maxSessionTokens: Number.MAX_SAFE_INTEGER + 1 })],
     ["invalid update flag", JSON.stringify({ updateCheckEnabled: "false" })],
     ["negative polling cap", JSON.stringify({ maxConsecutiveToolPollInferences: -1 })],
+    ["negative credit limit", JSON.stringify({ maxSessionCredits: -0.1 })],
   ])("fails clearly for %s", async (_label, contents) => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "evren-config-invalid-"));
     const localConfigPath = path.join(directory, "local.json");

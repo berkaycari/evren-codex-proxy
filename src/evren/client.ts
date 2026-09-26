@@ -24,6 +24,7 @@ export interface EvrenCreditState {
 
 export interface EvrenTransport {
   getModels(): Promise<unknown>;
+  getCreditState?(): EvrenCreditState;
   infer(input: string, maxOutputTokens: number): Promise<EvrenInferenceResult>;
   respond(request: NativeEvrenRequest): Promise<EvrenNativeResult>;
 }
@@ -95,7 +96,7 @@ export class EvrenClient implements EvrenTransport {
       input: request.input,
       tools: request.tools,
       tool_choice: request.tool_choice,
-      parallel_tool_calls: false,
+      parallel_tool_calls: request.parallel_tool_calls,
       max_output_tokens: request.max_output_tokens,
       stream: false,
     };

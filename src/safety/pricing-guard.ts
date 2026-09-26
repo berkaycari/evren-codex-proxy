@@ -1,5 +1,5 @@
 import type { EvrenTransport } from "../evren/client.js";
-import { evaluateModelPricing, type ModelPricing } from "../evren/pricing.js";
+import { evaluateModelPricing, isPaidPricing, type ModelPricing } from "../evren/pricing.js";
 import type { EventSink } from "../ui/logger.js";
 
 export interface PricingState {
@@ -34,6 +34,7 @@ export class PricingGuard {
       const payload = await this.client.getModels();
       const evaluation = evaluateModelPricing(payload, this.model);
       const wasAllowed = this.state.allowed;
+      const wasPaid = this.state.pricing ? isPaidPricing(this.state.pricing) : false;
       this.state = {
         allowed: evaluation.allowed,
         connected: true,
@@ -42,7 +43,17 @@ export class PricingGuard {
         ...(!evaluation.allowed && evaluation.pricing ? { pricing: evaluation.pricing } : {}),
       };
       if (evaluation.allowed) {
-        this.logger.log({ event: "PRICING_CHECK_OK", data: { model: this.model, currency: "CR" } });
+        const paid = isPaidPricing(evaluation.pricing);
+        this.logger.log({
+          event: paid && (!wasAllowed || !wasPaid) ? "PAID_PRICING_ACTIVE" : "PRICING_CHECK_OK",
+          data: {
+            model: this.model,
+            currency: "CR",
+            mode: paid ? "PAID" : "FREE",
+            promptTokenPrice: evaluation.pricing.promptTokenPrice,
+            completionTokenPrice: evaluation.pricing.completionTokenPrice,
+          },
+        });
       } else {
         this.logger.log({
           event: wasAllowed ? "PRICING_CHANGED" : "PRICING_CHECK_BLOCKED",

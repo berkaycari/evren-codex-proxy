@@ -18,13 +18,39 @@ export interface CodexResponse {
   };
   error: null;
   incomplete_details: null;
-  parallel_tool_calls: false;
+  parallel_tool_calls: boolean;
 }
 
 export interface BuiltCodexResponse {
   response: CodexResponse;
   item: Record<string, unknown>;
   callId?: string;
+  callIds?: string[];
+}
+
+export function buildCodexParallelToolResponse(
+  decisions: Array<{ name: string; arguments: Record<string, unknown>; callId: string; argumentsJson: string }>,
+  model: string,
+  usage: EvrenUsage,
+  tools: Map<string, NormalizedTool>,
+): BuiltCodexResponse {
+  if (decisions.length < 2) throw new Error("Parallel tool response requires at least two calls.");
+  const built = decisions.map((decision) => buildCodexResponse(
+    { kind: "tool_call", name: decision.name, arguments: decision.arguments },
+    model,
+    usage,
+    tools,
+    { callId: decision.callId, argumentsJson: decision.argumentsJson },
+  ));
+  const response = built[0]!.response;
+  response.output = built.map((item) => item.item);
+  response.parallel_tool_calls = true;
+  return {
+    response,
+    item: built[0]!.item,
+    ...(built[0]!.callId === undefined ? {} : { callId: built[0]!.callId }),
+    callIds: built.flatMap((item) => item.callId ? [item.callId] : []),
+  };
 }
 
 function id(prefix: string): string {
@@ -85,9 +111,9 @@ export function buildCodexResponse(
     output: [item],
     usage: {
       input_tokens: usage.inputTokens,
-      input_tokens_details: { cached_tokens: 0 },
+      input_tokens_details: { cached_tokens: usage.cachedTokens ?? 0 },
       output_tokens: usage.outputTokens,
-      output_tokens_details: { reasoning_tokens: 0 },
+      output_tokens_details: { reasoning_tokens: usage.reasoningTokens ?? 0 },
       total_tokens: usage.totalTokens,
     },
     error: null,

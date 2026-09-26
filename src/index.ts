@@ -108,9 +108,14 @@ async function main(): Promise<void> {
     const credits = client.getCreditState();
     const update = updateChecker.getState();
     const lastAction = logger.getRecent().at(-1)?.event ?? "Waiting for Codex";
+    const creditPolicyAllowed = config.maxSessionCredits === 0
+      && config.maxDailyCredits === 0
+      && (config.minCreditsRemaining === 0
+        || credits.remaining === undefined
+        || credits.remaining > config.minCreditsRemaining);
 
     const status =
-      pricingState.allowed && daily.accountingCertain
+      pricingState.allowed && daily.accountingCertain && creditPolicyAllowed
         ? "ONLINE"
         : "BLOCKED";
 
@@ -133,6 +138,9 @@ async function main(): Promise<void> {
         dailyTokens: config.maxDailyTokens,
         toolCalls: config.maxToolCallsPerSession,
         outputTokens: config.maxOutputTokensPerCall,
+        maxSessionCredits: config.maxSessionCredits,
+        maxDailyCredits: config.maxDailyCredits,
+        minCreditsRemaining: config.minCreditsRemaining,
         pollWarning: config.toolPollWarningThreshold,
         pollHardCap: config.maxConsecutiveToolPollInferences,
       },
@@ -148,6 +156,9 @@ async function main(): Promise<void> {
           pollCount: session.polling.active?.consecutivePolls ?? 0,
           pollTokens: session.polling.active?.authoritativeTokensSpent ?? 0,
           outputBudgetSaturated: session.lastOutputBudgetSaturated,
+          activeContextBytes: session.contextObservability.currentActiveContextBytes,
+          compactions: session.acceptedCompactionCount,
+          limitRecovery: session.limitRecovery,
         }
         : null,
       daily: {
@@ -192,6 +203,9 @@ async function main(): Promise<void> {
       customConfiguration: {
         maxSessionTokens: config.maxSessionTokens,
         maxDailyTokens: config.maxDailyTokens,
+        maxSessionCredits: config.maxSessionCredits,
+        maxDailyCredits: config.maxDailyCredits,
+        minCreditsRemaining: config.minCreditsRemaining,
         maxRequestsPerSession: config.maxRequestsPerSession,
         maxToolCallsPerSession: config.maxToolCallsPerSession,
         maxEstimatedInputTokensPerCall: config.maxEstimatedInputTokensPerCall,
@@ -225,6 +239,23 @@ async function main(): Promise<void> {
       applyEffectiveConfig,
     });
     if (result.status === "applied") currentPreset = result.preset ?? "Custom/current";
+    if (result.status === "applied" && request.recoveryLimitName) {
+      const session = sessions.getCurrent();
+      const recovery = session?.limitRecovery;
+      if (session && recovery?.limitName === request.recoveryLimitName) {
+        const newLimit = request.recoveryLimitName === "MAX_SESSION_TOKENS"
+          ? config.maxSessionTokens
+          : request.recoveryLimitName === "MAX_REQUESTS_PER_SESSION"
+            ? config.maxRequestsPerSession
+            : config.maxToolCallsPerSession;
+        recovery.appliedAt = new Date();
+        recovery.appliedLimit = newLimit;
+        logger.log({
+          event: "LIMIT_RECOVERY_APPLIED",
+          data: { limitName: request.recoveryLimitName, oldValue: recovery.limit, newValue: newLimit },
+        });
+      }
+    }
     lastDashboardFingerprint = "";
     render();
     return result;

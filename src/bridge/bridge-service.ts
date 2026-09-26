@@ -1,7 +1,9 @@
 import type { BridgeConfig } from "../config.js";
 import type { EvrenNativeResult, EvrenTransport } from "../evren/client.js";
 import type { EvrenUsage } from "../evren/extract-response.js";
-import { assertPostUsageAllowed, assertRequestAllowed, assertToolCallAllowed, LimitExceededError } from "../safety/limits.js";
+import { assertPostUsageAllowed, assertRequestAllowed, assertToolCallAllowed, assertToolCallsAllowed, LimitExceededError } from "../safety/limits.js";
+import { assertCreditPolicyAllowed } from "../safety/credit-policy.js";
+import { buildLimitRecovery } from "../safety/limit-recovery.js";
 import type { PricingGuard } from "../safety/pricing-guard.js";
 import {
   DeterministicRetryCircuit,
@@ -19,7 +21,7 @@ import type { UsageTracker } from "../usage/tracker.js";
 import type { EventSink } from "../ui/logger.js";
 import type { RequestClassification } from "../usage/types.js";
 import { buildEvrenPrompt, buildRepairPrompt, truncateToolOutput } from "./codex-to-evren.js";
-import { buildCodexResponse, type BuiltCodexResponse } from "./evren-to-codex.js";
+import { buildCodexParallelToolResponse, buildCodexResponse, type BuiltCodexResponse } from "./evren-to-codex.js";
 import {
   buildNativeEvrenRequest,
   nativeFunctionCall,
@@ -37,7 +39,7 @@ export interface BridgeResult extends BuiltCodexResponse {
   session: Session;
 }
 
-type ContinuationKind = "new_request" | "previous_response" | "tool_output" | "historical_replay" | "canonical_replay";
+type ContinuationKind = "new_request" | "previous_response" | "tool_output" | "historical_replay" | "canonical_replay" | "compaction_adoption";
 
 interface IncomingClassification {
   continuation: ContinuationKind;
@@ -85,11 +87,12 @@ export class BridgeService {
     const request = normalizeCodexRequest(body);
     const resolved = this.resolveSession(request);
     const session = resolved.session;
+    const compactionAdopted = this.adoptCompactedContext(session, request);
     const boundary: ContextBoundary = {
       nativeHistoryItems: session.nativeHistory.length,
       transcriptItems: session.transcript.length,
     };
-    const classification = this.classifyIncoming(session, request, resolved.canonicalReplay);
+    const classification = this.classifyIncoming(session, request, resolved.canonicalReplay, compactionAdopted);
     this.assertPollContinuationAllowed(session, classification);
 
     let activeToolCallIds: string[] = [];
@@ -99,6 +102,7 @@ export class BridgeService {
 
     this.deps.usage.assertCertain();
     this.deps.pricingGuard.assertAllowed();
+    assertCreditPolicyAllowed(this.deps.config, this.deps.client.getCreditState?.());
     const tools = request.tools.length > 0 ? request.tools : [...session.tools.values()];
     request.tools = tools;
     session.tools = new Map(tools.map((tool) => [tool.name, tool]));
@@ -110,9 +114,40 @@ export class BridgeService {
       this.appendIncoming(session, request.entries, classification);
     }
 
-    return this.deps.config.toolTransport === "native"
-      ? this.handleNative(request, session, tools, activeToolCallIds, boundary)
-      : this.handleTextual(request, session, tools, activeToolCallIds, boundary);
+    const inferenceCountBefore = session.inferenceCount;
+    try {
+      const result = await (this.deps.config.toolTransport === "native"
+        ? this.handleNative(request, session, tools, activeToolCallIds, boundary)
+        : this.handleTextual(request, session, tools, activeToolCallIds, boundary));
+      this.recordSuccessfulWindowState(session, request);
+      this.clearSatisfiedRecovery(session);
+      return result;
+    } catch (error) {
+      if (error instanceof LimitExceededError) {
+        const recovery = buildLimitRecovery(error, this.deps.config);
+        session.limitRecovery = recovery;
+        error.recoverable = recovery.recoverable;
+        error.inferenceMade = session.inferenceCount !== inferenceCountBefore;
+        if (recovery.recommended !== undefined) error.recommended = recovery.recommended;
+        this.deps.logger.log({
+          event: "LIMIT_RECOVERY_REQUIRED",
+          level: "warn",
+          message: recovery.recoverable
+            ? session.inferenceCount === inferenceCountBefore
+              ? "Local Bridge limit reached. No additional EVREN inference was made; use R in the Bridge terminal or F1 -> C, then continue in Codex."
+              : "Local Bridge limit was reached after authoritative usage was recorded; use R in the Bridge terminal or F1 -> C, then continue in Codex."
+            : "Local Bridge safety limit reached; review Custom configuration before continuing.",
+          data: {
+            limitName: recovery.limitName,
+            current: recovery.current,
+            limit: recovery.limit,
+            recoverable: recovery.recoverable,
+            ...(recovery.recommended === undefined ? {} : { recommended: recovery.recommended }),
+          },
+        });
+      }
+      throw error;
+    }
   }
 
   private async handleNative(
@@ -155,7 +190,7 @@ export class BridgeService {
     const result = await this.respondAndAccount(session, upstream, metrics);
     let decision: ReturnType<typeof parseNativeEvrenResponse>;
     try {
-      decision = parseNativeEvrenResponse(result.raw, session.tools);
+      decision = parseNativeEvrenResponse(result.raw, session.tools, request.parallelToolCalls);
     } catch (error) {
       if (error instanceof ToolProtocolError) {
         this.retryCircuit.recordFailure(requestFingerprint, error.code);
@@ -172,11 +207,50 @@ export class BridgeService {
       this.deps.logger.log({
         event: "NATIVE_MULTI_TOOL_SERIALIZED",
         level: "warn",
-        message: `${decision.returnedCallCount} calls → serialized to 1`,
+        message: `${decision.returnedCallCount} calls → serialized to 1 because Codex disabled parallel tool calls.`,
         data: { returnedCallCount: decision.returnedCallCount, selectedTool: decision.name },
       });
     }
+    if (decision.kind === "tool_calls" && !request.parallelToolCalls) {
+      this.deps.logger.log({
+        event: "NATIVE_MULTI_TOOL_SERIALIZED",
+        level: "warn",
+        message: `${decision.calls.length} calls → serialized to 1 because Codex disabled parallel tool calls.`,
+        data: { returnedCallCount: decision.calls.length, selectedTool: decision.calls[0]!.name },
+      });
+      const first = decision.calls[0]!;
+      decision = { kind: "tool_call", ...first, returnedCallCount: decision.calls.length };
+    }
     if (decision.kind === "tool_call") assertToolCallAllowed(this.deps.config, session);
+    if (decision.kind === "tool_calls") assertToolCallsAllowed(this.deps.config, session, decision.calls.length);
+
+    if (decision.kind === "tool_calls") {
+      delete session.polling.active;
+      const built = buildCodexParallelToolResponse(
+        decision.calls,
+        this.deps.config.model,
+        result.usage,
+        session.tools,
+      );
+      this.deps.sessions.recordResponse(session, built.response.id);
+      for (const call of decision.calls) {
+        const tool = session.tools.get(call.name);
+        if (!tool) throw new Error("Tool disappeared while recording a native parallel call.");
+        this.deps.sessions.recordPendingToolCall(session, { callId: call.callId, tool });
+        session.nativeHistory.push(nativeFunctionCall(call.callId, call.name, call.argumentsJson));
+        session.transcript.push({
+          role: "assistant",
+          text: `Requested tool ${call.name} with arguments ${call.argumentsJson}`,
+          toolName: call.name,
+          callId: call.callId,
+        });
+        this.deps.logger.log({ event: "NATIVE_TOOL_REQUEST", data: { tool: call.name } });
+        this.deps.logger.log({ event: "TOOL_REQUEST", data: { tool: call.name } });
+      }
+      session.toolCallCount += decision.calls.length;
+      this.completeActiveCalls(session, activeToolCallIds);
+      return { ...built, stream: request.stream, session };
+    }
 
     const modelDecision: ModelDecision = decision.kind === "final"
       ? decision
@@ -191,6 +265,7 @@ export class BridgeService {
         ? { callId: decision.callId, argumentsJson: decision.argumentsJson }
         : {},
     );
+    built.response.parallel_tool_calls = request.parallelToolCalls;
     this.deps.sessions.recordResponse(session, built.response.id);
 
     if (decision.kind === "tool_call" && built.callId) {
@@ -339,8 +414,6 @@ export class BridgeService {
         tools: tools.map((tool) => ({
           name: tool.name,
           kind: tool.kind,
-          description: tool.description,
-          inputSchema: tool.inputSchema,
         })),
       },
     });
@@ -382,6 +455,7 @@ export class BridgeService {
         continue;
       }
       if (continuation === "tool_output") continue;
+      if (continuation === "compaction_adoption") continue;
       if (replayedMessageIndexes.has(entryIndex)) continue;
       if ((continuation === "previous_response" || continuation === "historical_replay" || continuation === "canonical_replay")
         && entry.role === "assistant") continue;
@@ -397,18 +471,25 @@ export class BridgeService {
     session: Session,
     request: NormalizedCodexRequest,
     canonicalReplay: boolean,
+    compactionAdopted: boolean,
   ): IncomingClassification {
     const toolEntries = request.entries.filter((entry) => entry.role === "tool");
     if (toolEntries.length === 0) {
-      const continuation = request.previousResponseId
+      const detectedReplayIndexes = this.findReplayedMessageIndexes(session, request.entries);
+      const threadReplay = request.turnMetadata.threadId !== undefined && detectedReplayIndexes.size > 0;
+      const continuation = compactionAdopted
+        ? "compaction_adoption"
+        : request.previousResponseId
         ? "previous_response"
-        : canonicalReplay
+        : canonicalReplay || threadReplay
           ? "canonical_replay"
           : "new_request";
-      const replayedMessageIndexes = continuation === "previous_response" || continuation === "canonical_replay"
-        ? this.findReplayedMessageIndexes(session, request.entries)
+      const replayedMessageIndexes = continuation === "compaction_adoption"
+        ? new Set(request.entries.map((_entry, index) => index))
+        : continuation === "previous_response" || continuation === "canonical_replay"
+        ? detectedReplayIndexes
         : new Set<number>();
-      if (continuation === "canonical_replay") {
+      if (continuation === "canonical_replay" && request.requestClassification !== "internal") {
         const hasNewUserInput = request.entries.some((entry, index) =>
           entry.role === "user" && entry.text.trim().length > 0 && !replayedMessageIndexes.has(index),
         );
@@ -426,7 +507,7 @@ export class BridgeService {
     const prepared = this.deps.sessions.prepareIncomingToolOutputs(session, toolEntries.map((entry) => {
       if (!entry.callId) throw new InvalidRequestError("Tool output is missing call_id.");
       return { callId: entry.callId, output: entry.text };
-    }));
+    }), this.deps.config.toolTransport === "native");
     if (prepared.active.length > 0) {
       return { continuation: "tool_output", prepared, replayedMessageIndexes: new Set<number>() };
     }
@@ -451,23 +532,106 @@ export class BridgeService {
   }
 
   private resolveSession(request: NormalizedCodexRequest): { session: Session; canonicalReplay: boolean } {
+    const threadId = request.turnMetadata.threadId;
     if (request.previousResponseId) {
-      return { session: this.deps.sessions.resolve(request.previousResponseId), canonicalReplay: false };
+      const session = this.deps.sessions.resolve(request.previousResponseId);
+      if (threadId) this.deps.sessions.assertThreadAssociation(session, threadId);
+      return { session, canonicalReplay: false };
     }
     if (request.toolOutputCallIds.length > 0) {
+      const session = this.deps.sessions.resolveByToolCallIds(request.toolOutputCallIds);
+      if (threadId) this.deps.sessions.assertThreadAssociation(session, threadId);
       return {
-        session: this.deps.sessions.resolveByToolCallIds(request.toolOutputCallIds),
+        session,
         canonicalReplay: false,
       };
+    }
+    if (threadId) {
+      const threaded = this.deps.sessions.resolveByThreadId(threadId);
+      if (threaded) return { session: threaded, canonicalReplay: false };
     }
     const replay = this.deps.sessions.resolveByCanonicalReplay(
       request.entries.flatMap((entry) => entry.role === "tool"
         ? []
         : [{ role: entry.role, text: entry.text }]),
     );
-    return replay
-      ? { session: replay, canonicalReplay: true }
-      : { session: this.deps.sessions.resolve(), canonicalReplay: false };
+    if (replay) {
+      if (threadId) this.deps.sessions.associateThread(replay, threadId);
+      return { session: replay, canonicalReplay: true };
+    }
+    const session = this.deps.sessions.resolve();
+    if (threadId) this.deps.sessions.associateThread(session, threadId);
+    return { session, canonicalReplay: false };
+  }
+
+  private adoptCompactedContext(session: Session, request: NormalizedCodexRequest): boolean {
+    const pending = session.pendingCompaction;
+    if (!pending || request.requestKind === "compaction") return false;
+    const metadata = request.turnMetadata;
+    const transitioned = changedIdentity(pending.windowId ?? session.context.windowId, metadata.windowId)
+      || changedIdentity(pending.contextWindowId ?? session.context.contextWindowId, metadata.contextWindowId)
+      || advancedWindow(pending.windowNumber ?? session.context.windowNumber, metadata.windowNumber);
+    if (!transitioned) return false;
+    if (request.entries.some((entry) => entry.role === "tool")) return false;
+    const canonicalEntries = request.entries.filter(
+      (entry): entry is typeof entry & { role: "user" | "assistant" } => entry.role !== "tool",
+    );
+    if (canonicalEntries.length === 0) return false;
+
+    const transcript = canonicalEntries.map((entry) => ({ role: entry.role, text: entry.text }));
+    const nativeHistory = [
+      ...(request.instructions ? [nativeMessage("developer", request.instructions)] : []),
+      ...canonicalEntries.map((entry) => nativeMessage(entry.role, entry.text)),
+    ];
+    const previousItems = session.nativeHistory.length;
+    const previousBytes = jsonBytes(session.nativeHistory);
+    this.deps.sessions.replaceActiveContext(session, {
+      transcript,
+      nativeHistory,
+      ...(metadata.windowId === undefined ? {} : { windowId: metadata.windowId }),
+      ...(metadata.windowNumber === undefined ? {} : { windowNumber: metadata.windowNumber }),
+      ...(metadata.contextWindowId === undefined ? {} : { contextWindowId: metadata.contextWindowId }),
+    });
+    this.deps.logger.log({
+      event: "CONTEXT_WINDOW_COMPACTED",
+      data: {
+        previousItemCount: previousItems,
+        newItemCount: nativeHistory.length,
+        previousBytes,
+        newBytes: jsonBytes(nativeHistory),
+        compactionCount: session.acceptedCompactionCount,
+      },
+    });
+    return true;
+  }
+
+  private recordSuccessfulWindowState(session: Session, request: NormalizedCodexRequest): void {
+    const metadata = request.turnMetadata;
+    if (request.requestKind === "compaction") {
+      session.pendingCompaction = {
+        requestedAt: new Date(),
+        ...(metadata.windowId === undefined ? {} : { windowId: metadata.windowId }),
+        ...(metadata.windowNumber === undefined ? {} : { windowNumber: metadata.windowNumber }),
+        ...(metadata.contextWindowId === undefined ? {} : { contextWindowId: metadata.contextWindowId }),
+      };
+      return;
+    }
+    if (metadata.windowId !== undefined) session.context.windowId = metadata.windowId;
+    if (metadata.windowNumber !== undefined) session.context.windowNumber = metadata.windowNumber;
+    if (metadata.contextWindowId !== undefined) session.context.contextWindowId = metadata.contextWindowId;
+  }
+
+  private clearSatisfiedRecovery(session: Session): void {
+    const recovery = session.limitRecovery;
+    if (!recovery) return;
+    const limit = recovery.limitName === "MAX_SESSION_TOKENS"
+      ? this.deps.config.maxSessionTokens
+      : recovery.limitName === "MAX_REQUESTS_PER_SESSION"
+        ? this.deps.config.maxRequestsPerSession
+        : recovery.limitName === "MAX_TOOL_CALLS_PER_SESSION"
+          ? this.deps.config.maxToolCallsPerSession
+          : recovery.limit;
+    if (limit > recovery.current) delete session.limitRecovery;
   }
 
   private findReplayedMessageIndexes(
@@ -643,10 +807,24 @@ export class BridgeService {
       "requestNumber" | "payloadChars" | "payloadBytes" | "historyItems" | "toolCount" | "requestClassification">,
   ): InferenceMetrics {
     session.inferenceCount += 1;
+    const payloadBytes = Buffer.byteLength(serializedPayload, "utf8");
+    const activeContextBytes = breakdown.instructionBytes
+      + breakdown.canonicalHistoryBytes
+      + breakdown.currentInputBytes;
+    session.contextObservability.totalUpstreamPayloadBytes += payloadBytes;
+    session.contextObservability.canonicalHistoryReplayBytes += breakdown.canonicalHistoryBytes;
+    session.contextObservability.currentInputBytes += breakdown.currentInputBytes;
+    session.contextObservability.toolCatalogBytes += breakdown.toolCatalogBytes;
+    session.contextObservability.acceptedToolOutputReplayBytes += breakdown.acceptedToolOutputBytes;
+    session.contextObservability.currentActiveContextBytes = activeContextBytes;
+    session.contextObservability.peakActiveContextBytes = Math.max(
+      session.contextObservability.peakActiveContextBytes,
+      activeContextBytes,
+    );
     return {
       requestNumber: session.inferenceCount,
       payloadChars: serializedPayload.length,
-      payloadBytes: Buffer.byteLength(serializedPayload, "utf8"),
+      payloadBytes,
       historyItems,
       toolCount,
       requestClassification,
@@ -771,11 +949,20 @@ function replayedEntryMatches(
 }
 
 function addUsage(left: EvrenUsage, right: EvrenUsage): EvrenUsage {
+  const cachedTokens = addOptionalUsage(left.cachedTokens, right.cachedTokens);
+  const reasoningTokens = addOptionalUsage(left.reasoningTokens, right.reasoningTokens);
   return {
     inputTokens: left.inputTokens + right.inputTokens,
     outputTokens: left.outputTokens + right.outputTokens,
     totalTokens: left.totalTokens + right.totalTokens,
+    ...(cachedTokens === undefined ? {} : { cachedTokens }),
+    ...(reasoningTokens === undefined ? {} : { reasoningTokens }),
   };
+}
+
+function addOptionalUsage(left: number | undefined, right: number | undefined): number | undefined {
+  if (left === undefined && right === undefined) return undefined;
+  return (left ?? 0) + (right ?? 0);
 }
 
 function nativePayloadBreakdown(
@@ -838,6 +1025,14 @@ function isDeveloperMessage(item: Record<string, unknown>): boolean {
 
 function jsonBytes(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+function changedIdentity(previous: string | undefined, next: string | undefined): boolean {
+  return previous !== undefined && next !== undefined && previous !== next;
+}
+
+function advancedWindow(previous: number | undefined, next: number | undefined): boolean {
+  return previous !== undefined && next !== undefined && next > previous;
 }
 
 function elapsedSeconds(startedAt: Date, endedAt: Date): number {

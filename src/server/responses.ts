@@ -6,11 +6,12 @@ import { InvalidRequestError } from "../bridge/normalize-codex-request.js";
 import { InvalidNativeToolChoiceError } from "../bridge/native-codex-to-evren.js";
 import { LimitExceededError } from "../safety/limits.js";
 import { PricingBlockedError } from "../safety/pricing-guard.js";
-import { InvalidToolCallSessionError, UnknownPreviousResponseError } from "../sessions/store.js";
+import { ConflictingSessionIdentityError, InvalidToolCallSessionError, UnknownPreviousResponseError } from "../sessions/store.js";
 import { AccountingUncertainError } from "../usage/tracker.js";
 import { RetryCircuitBlockedError } from "../safety/deterministic-retry-circuit.js";
 import { ToolPollLimitError } from "../bridge/tool-polling.js";
 import type { EventSink } from "../ui/logger.js";
+import { CreditBudgetUnsupportedError, CreditFloorExceededError } from "../safety/credit-policy.js";
 
 export function registerResponsesRoute(
   app: FastifyInstance,
@@ -47,6 +48,7 @@ function sendError(reply: FastifyReply, error: unknown): FastifyReply {
   if (error instanceof InvalidRequestError
     || error instanceof InvalidNativeToolChoiceError
     || error instanceof UnknownPreviousResponseError
+    || error instanceof ConflictingSessionIdentityError
     || error instanceof InvalidToolCallSessionError
     || error instanceof ToolPollLimitError) {
     status = 400;
@@ -56,6 +58,16 @@ function sendError(reply: FastifyReply, error: unknown): FastifyReply {
   } else if (error instanceof LimitExceededError) {
     status = 429;
     type = "rate_limit_error";
+    code = error.code;
+    message = error.message;
+  } else if (error instanceof CreditFloorExceededError) {
+    status = 429;
+    type = "credit_limit_error";
+    code = error.code;
+    message = error.message;
+  } else if (error instanceof CreditBudgetUnsupportedError) {
+    status = 503;
+    type = "credit_policy_error";
     code = error.code;
     message = error.message;
   } else if (error instanceof PricingBlockedError) {
@@ -76,7 +88,21 @@ function sendError(reply: FastifyReply, error: unknown): FastifyReply {
   } else if (error instanceof Error) {
     message = error.message;
   }
+  const details = error instanceof LimitExceededError
+    ? {
+      limit_name: error.limitName,
+      current: error.current,
+      limit: error.limit,
+      recoverable: error.recoverable,
+      ...(error.recommended === undefined ? {} : { recommended: error.recommended }),
+    }
+    : error instanceof CreditFloorExceededError
+      ? { remaining: error.remaining, minimum: error.minimum, recoverable: false }
+      : {};
+  const helpfulMessage = error instanceof LimitExceededError && error.recoverable
+    ? `${message} Local EVREN Bridge limit reached; ${error.inferenceMade ? "authoritative usage was recorded before the post-response limit check" : "no additional EVREN inference was made"}. No failed request is replayed automatically. In the Bridge terminal press R to raise only the recommended limit, or use F1 -> C. Then return to Codex and continue the task.`
+    : message;
   return reply.status(status).send({
-    error: { message, type, param: null, code },
+    error: { message: helpfulMessage, type, param: null, code, ...details },
   });
 }

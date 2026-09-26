@@ -14,7 +14,7 @@ describe("public release documentation", () => {
     expect(readme).not.toContain("<gerçek-proje-klasörü>");
     expect(envExample).toContain("EVREN_API_KEY=replace-in-process-environment-only");
     expect(envExample).not.toMatch(/\b(?:sk|key|token)-[A-Za-z0-9_-]{16,}\b/);
-    expect(readme).toContain("EVREN Codex Bridge `v1.2.0`");
+    expect(readme).toContain("EVREN Codex Bridge `v1.3.0`");
     expect(readme).toContain("yalnızca `F1`, Türkçe Yardım / Hızlı Başlangıç ekranını açar");
     expect(readme).not.toContain("`F1`, `?` veya `H`/`h`");
     expect(readme).toContain("Preseti `↑` / `↓` ile seçip `Enter` ile onaylayın");

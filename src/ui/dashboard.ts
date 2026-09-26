@@ -51,6 +51,9 @@ export type DashboardPreset = "Standard" | "Coding" | "Custom";
 export interface DashboardCustomConfiguration {
   maxSessionTokens: number;
   maxDailyTokens: number;
+  maxSessionCredits: number;
+  maxDailyCredits: number;
+  minCreditsRemaining: number;
   maxRequestsPerSession: number;
   maxToolCallsPerSession: number;
   maxEstimatedInputTokensPerCall: number;
@@ -67,6 +70,7 @@ export interface DashboardCustomConfiguration {
 export interface DashboardConfigurationRequest {
   preset: DashboardPreset;
   customConfiguration?: DashboardCustomConfiguration;
+  recoveryLimitName?: "MAX_SESSION_TOKENS" | "MAX_REQUESTS_PER_SESSION" | "MAX_TOOL_CALLS_PER_SESSION";
 }
 
 interface DashboardOptions {
@@ -82,7 +86,7 @@ export type DashboardStage = "READY" | "CODEX" | "EVREN" | "TOOL" | "RESULT" | "
 
 type CustomNumberKey = Exclude<keyof DashboardCustomConfiguration, "updateCheckEnabled">;
 
-const customNumberFields: ReadonlyArray<{ key: CustomNumberKey; label: string; minimum: number }> = [
+const customNumberFields: ReadonlyArray<{ key: CustomNumberKey; label: string; minimum: number; decimal?: boolean }> = [
   { key: "maxSessionTokens", label: "Oturum token limiti", minimum: 1 },
   { key: "maxDailyTokens", label: "Günlük token limiti", minimum: 1 },
   { key: "maxRequestsPerSession", label: "İstek / oturum", minimum: 1 },
@@ -95,6 +99,9 @@ const customNumberFields: ReadonlyArray<{ key: CustomNumberKey; label: string; m
   { key: "sessionTtlMinutes", label: "Oturum TTL (dakika)", minimum: 1 },
   { key: "pricingRefreshMinutes", label: "Fiyat yenileme (dakika)", minimum: 1 },
   { key: "requestTimeoutMs", label: "İstek zaman aşımı (ms)", minimum: 1 },
+  { key: "maxSessionCredits", label: "Oturum kredi limiti (0 kapatır)", minimum: 0, decimal: true },
+  { key: "maxDailyCredits", label: "Günlük kredi limiti (0 kapatır)", minimum: 0, decimal: true },
+  { key: "minCreditsRemaining", label: "Minimum kalan kredi (0 kapatır)", minimum: 0, decimal: true },
 ];
 
 const customFieldCount = customNumberFields.length + 1;
@@ -241,6 +248,10 @@ export class Dashboard {
     if (this.configuring) return;
 
     if (this.view === "dashboard") {
+      if (key === "recover") {
+        this.applyRecommendedRecovery();
+        return;
+      }
       if (key === "help") {
         this.notice = undefined;
         this.view = "help";
@@ -367,7 +378,8 @@ export class Dashboard {
       }
 
       if (this.customFieldIndex < customNumberFields.length) {
-        if (value >= "0" && value <= "9") {
+        const field = customNumberFields[this.customFieldIndex]!;
+        if ((value >= "0" && value <= "9") || (field.decimal && value === "." && !this.customDraft.includes("."))) {
           this.customDraft += value;
           this.customError = undefined;
           this.draw();
@@ -397,8 +409,13 @@ export class Dashboard {
       const field = customNumberFields[this.customFieldIndex]!;
       if (this.customDraft.length > 0) {
         const parsed = Number(this.customDraft);
-        if (!Number.isSafeInteger(parsed) || parsed < field.minimum || parsed > 2_147_483_647) {
-          this.customError = `${field.minimum} ile 2147483647 arasında tam sayı girin.`;
+        const valid = field.decimal
+          ? Number.isFinite(parsed) && parsed >= field.minimum
+          : Number.isSafeInteger(parsed) && parsed >= field.minimum && parsed <= 2_147_483_647;
+        if (!valid) {
+          this.customError = field.decimal
+            ? `${field.minimum} veya daha büyük sonlu bir sayı girin.`
+            : `${field.minimum} ile 2147483647 arasında tam sayı girin.`;
           this.draw();
           return;
         }
@@ -429,6 +446,24 @@ export class Dashboard {
     this.customError = undefined;
     this.notice = "Yapılandırma iptal edildi · önceki ayarlar korundu.";
     this.draw();
+  }
+
+  private applyRecommendedRecovery(): void {
+    const recovery = this.snapshot?.session?.limitRecovery;
+    const current = this.snapshot?.customConfiguration;
+    if (!recovery?.recoverable || recovery.appliedAt || recovery.recommended === undefined || !current || !this.onConfigure) return;
+    const environmentName = recovery.limitName;
+    if (this.environment[environmentName] !== undefined) {
+      this.notice = `${environmentName} environment tarafından yönetiliyor; değişiklikten sonra yeniden başlatma gerekebilir.`;
+      this.draw();
+      return;
+    }
+    const customConfiguration = { ...current };
+    if (recovery.limitName === "MAX_SESSION_TOKENS") customConfiguration.maxSessionTokens = recovery.recommended;
+    else if (recovery.limitName === "MAX_REQUESTS_PER_SESSION") customConfiguration.maxRequestsPerSession = recovery.recommended;
+    else if (recovery.limitName === "MAX_TOOL_CALLS_PER_SESSION") customConfiguration.maxToolCallsPerSession = recovery.recommended;
+    else return;
+    void this.configure({ preset: "Custom", customConfiguration, recoveryLimitName: recovery.limitName });
   }
 
   private async configure(request: DashboardConfigurationRequest): Promise<void> {
@@ -542,12 +577,33 @@ export function buildDashboardLines(
   const maxRows = Math.max(1, Math.floor(terminal.rows ?? 30));
   const inner = width - 2;
   const session = snapshot.session;
+  if (session?.limitRecovery) {
+    const recovery = session.limitRecovery;
+    const lines = [
+      `╭${"─".repeat(inner)}╮`,
+      colorFirst(boxedText("LIMIT REACHED", inner), "LIMIT REACHED", red, true),
+      divider(inner, "├", "┤"),
+      boxedText(recovery.limitName, inner),
+      boxedPair("Current", formatNumber(recovery.current), "Limit", formatNumber(recovery.limit), inner),
+      boxedText("Başarısız istek otomatik yeniden oynatılmaz.", inner),
+      ...(recovery.appliedAt
+        ? [colorFirst(boxedText(`Limit ${formatNumber(recovery.appliedLimit ?? recovery.limit)} olarak uygulandı; Codex terminaline dönün.`, inner), "uygulandı", green, true)]
+        : recovery.recoverable && recovery.recommended !== undefined
+        ? [colorFirst(boxedText(`[R] Önerilen limiti yükselt → ${formatNumber(recovery.recommended)}`, inner), "[R]", cyan, true)]
+        : []),
+      boxedText("[F1 → C] Özel yapılandırma   [Esc] Limiti koru", inner),
+      boxedText("Sonra Codex terminaline dönüp aynı göreve devam edin.", inner),
+      ...(notice ? [boxedText(notice, inner)] : []),
+      `╰${"─".repeat(inner)}╯`,
+    ];
+    return lines.slice(0, maxRows);
+  }
   const requestCount = session?.requestCount ?? 0;
   const sessionTokens = session?.usage.totalTokens ?? 0;
   const tools = session?.toolCallCount ?? 0;
   const inferences = session?.inferenceCount ?? 0;
   const pricingText = snapshot.pricing.pricing
-    ? `prompt ${snapshot.pricing.pricing.promptTokenPrice} · completion ${snapshot.pricing.pricing.completionTokenPrice} ${snapshot.pricing.pricing.currency}`
+    ? `${snapshot.pricing.pricing.promptTokenPrice > 0 || snapshot.pricing.pricing.completionTokenPrice > 0 ? "PAID" : "FREE"} · prompt ${snapshot.pricing.pricing.promptTokenPrice} · completion ${snapshot.pricing.pricing.completionTokenPrice} ${snapshot.pricing.pricing.currency}`
     : "unverified";
   const stage = deriveDashboardStage(recent);
   const lastUsage = session?.lastUsage
@@ -588,6 +644,13 @@ export function buildDashboardLines(
       inner,
     )] : []),
     boxedPair("Session", `${formatNumber(sessionTokens)} / ${formatNumber(snapshot.limits.sessionTokens)}`, "Daily", `${formatNumber(snapshot.daily.totalTokens)} / ${formatNumber(snapshot.limits.dailyTokens)}`, inner),
+    ...(session ? [boxedPair(
+      "Active",
+      `≈${formatCompact(Math.ceil(session.contextObservability.currentActiveContextBytes / 3))} tokens`,
+      "Compacts",
+      `${formatNumber(session.acceptedCompactionCount)}${session.context.windowNumber === undefined ? "" : ` · W${session.context.windowNumber}`}`,
+      inner,
+    )] : []),
     boxedPair("Usage", progress(sessionTokens, snapshot.limits.sessionTokens, Math.max(4, Math.floor(inner / 3))), "Last", lastUsage, inner),
     ...(showHelpHint ? [colorFirst(boxedText("Yardım: F1", inner), "F1", cyan, true)] : []),
     ...(notice ? [colorFirst(boxedText(notice, inner), "Yapılandırma", green, true)] : []),
@@ -601,7 +664,7 @@ export function buildDashboardLines(
   return [...box, liveHeader, ...events].slice(0, maxRows);
 }
 
-export type DashboardKey = "help" | "back" | "configure" | "interrupt" | "up" | "down" | "enter";
+export type DashboardKey = "help" | "back" | "configure" | "recover" | "interrupt" | "up" | "down" | "enter";
 
 export function parseDashboardKeys(chunk: string | Buffer): DashboardKey[] {
   const input = typeof chunk === "string" ? chunk : chunk.toString("utf8");
@@ -637,6 +700,7 @@ export function parseDashboardKeys(chunk: string | Buffer): DashboardKey[] {
     else if (value === "\u001b") keys.push("back");
     else if (value === "b" || value === "B") keys.push("back");
     else if (value === "c" || value === "C") keys.push("configure");
+    else if (value === "r" || value === "R") keys.push("recover");
     else if (value === "\r" || value === "\n") keys.push("enter");
     index += 1;
   }
@@ -673,6 +737,15 @@ export function buildHelpLines(
     boxedPair("Oturum", formatNumber(snapshot.limits.sessionTokens), "Günlük", formatNumber(snapshot.limits.dailyTokens), inner),
     boxedPair("İstek", formatNumber(snapshot.limits.requests), "Araç", formatNumber(snapshot.limits.toolCalls), inner),
     boxedText(`Çıktı/istek ${formatNumber(snapshot.limits.outputTokens)} · Poll uyarı ${formatNumber(snapshot.limits.pollWarning)} · hard cap ${hardCap}`, inner),
+    ...(snapshot.session ? [
+      boxedText(`Aktif bağlam ≈${formatCompact(Math.ceil(snapshot.session.contextObservability.currentActiveContextBytes / 3))} token · compaction ${snapshot.session.acceptedCompactionCount}`, inner),
+      boxedText(`History replay ${formatNumber(snapshot.session.contextObservability.canonicalHistoryReplayBytes)} byte · tool catalog ${formatNumber(snapshot.session.contextObservability.toolCatalogBytes)} byte`, inner),
+      boxedText(`Toplam payload ${formatNumber(snapshot.session.contextObservability.totalUpstreamPayloadBytes)} byte · replay payı ${formatPercent(replayShare(snapshot.session))}`, inner),
+    ] : []),
+    ...(snapshot.customConfiguration ? [
+      boxedText(`Kredi: oturum ${snapshot.customConfiguration.maxSessionCredits} · günlük ${snapshot.customConfiguration.maxDailyCredits} · kalan tabanı ${snapshot.customConfiguration.minCreditsRemaining}`, inner),
+      boxedText("Kesin CR harcama hesabı sağlayıcı sözleşmesi olmadığı için kullanılamıyor.", inner),
+    ] : []),
     boxedText("Öncelik: environment > config/local.json > config/defaults.json", inner),
     boxedText("EVREN_API_KEY yalnızca environment; local.json yerel/ignore edilir.", inner),
     boxedText("STANDART: 1200000 / 60 / 80; günlük 10000000; çıktı 4096.", inner),
@@ -980,6 +1053,15 @@ export function formatLocalTime(value: string | number | Date): string {
 
 function formatNumber(value: number): string {
   return value.toLocaleString("en-US");
+}
+
+function replayShare(session: Session): number {
+  const total = session.contextObservability.totalUpstreamPayloadBytes;
+  return total === 0 ? 0 : session.contextObservability.canonicalHistoryReplayBytes / total;
+}
+
+function formatPercent(value: number): string {
+  return `${Math.round(Math.max(0, Math.min(1, value)) * 100)}%`;
 }
 
 function formatCompact(value: number): string {

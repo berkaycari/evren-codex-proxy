@@ -12,18 +12,40 @@ export type NativeEvrenDecision = {
   arguments: Record<string, unknown>;
   argumentsJson: string;
   returnedCallCount: number;
+} | {
+  kind: "tool_calls";
+  calls: NativeEvrenToolCall[];
 };
+
+export interface NativeEvrenToolCall {
+  callId: string;
+  name: string;
+  arguments: Record<string, unknown>;
+  argumentsJson: string;
+}
 
 export function parseNativeEvrenResponse(
   raw: unknown,
   tools: ReadonlyMap<string, NormalizedTool>,
+  parallelToolCalls = true,
 ): NativeEvrenDecision {
   if (!raw || typeof raw !== "object" || !Array.isArray((raw as { output?: unknown }).output)) {
     throw protocolError("EVREN native response does not contain an output array.");
   }
   const output = (raw as { output: unknown[] }).output;
   const calls = output.filter((item) => isRecord(item) && item.type === "function_call") as Record<string, unknown>[];
-  if (calls.length > 0) return parseFunctionCall(calls[0]!, tools, calls.length);
+  if (calls.length > 0) {
+    if (!parallelToolCalls) return parseFunctionCall(calls[0]!, tools, calls.length);
+    const parsed = calls.map((call) => parseFunctionCall(call, tools, calls.length));
+    const seen = new Set<string>();
+    for (const call of parsed) {
+      if (seen.has(call.callId)) throw protocolError(`EVREN repeated native call_id: ${call.callId}`);
+      seen.add(call.callId);
+    }
+    return parsed.length === 1
+      ? parsed[0]!
+      : { kind: "tool_calls", calls: parsed.map(({ returnedCallCount: _count, kind: _kind, ...call }) => call) };
+  }
 
   try {
     return { kind: "final", content: extractResponseText(raw) };
@@ -36,7 +58,7 @@ function parseFunctionCall(
   call: Record<string, unknown>,
   tools: ReadonlyMap<string, NormalizedTool>,
   returnedCallCount: number,
-): NativeEvrenDecision {
+): Extract<NativeEvrenDecision, { kind: "tool_call" }> {
   if (typeof call.name !== "string" || typeof call.call_id !== "string" || !call.call_id
     || typeof call.arguments !== "string") {
     throw protocolError("EVREN native function_call is missing name, call_id, or JSON arguments.");

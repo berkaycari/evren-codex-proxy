@@ -2,6 +2,8 @@ export interface EvrenUsage {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  cachedTokens?: number;
+  reasoningTokens?: number;
 }
 
 export function extractResponseText(payload: unknown): string {
@@ -42,5 +44,23 @@ export function extractUsage(payload: unknown): EvrenUsage | undefined {
     typeof total !== "number" || !Number.isSafeInteger(total) || total < 0 ||
     total !== input + output
   ) return undefined;
-  return { inputTokens: input, outputTokens: output, totalTokens: total };
+  const inputDetails = isRecord(record.input_tokens_details) ? record.input_tokens_details : undefined;
+  const outputDetails = isRecord(record.output_tokens_details) ? record.output_tokens_details : undefined;
+  const cachedTokens = validOptionalTokenCount(inputDetails?.cached_tokens);
+  const reasoningTokens = validOptionalTokenCount(outputDetails?.reasoning_tokens);
+  return {
+    inputTokens: input,
+    outputTokens: output,
+    totalTokens: total,
+    ...(cachedTokens === undefined ? {} : { cachedTokens }),
+    ...(reasoningTokens === undefined ? {} : { reasoningTokens }),
+  };
+}
+
+function validOptionalTokenCount(value: unknown): number | undefined {
+  return Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
