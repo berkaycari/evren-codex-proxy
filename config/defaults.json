@@ -16,6 +16,7 @@
   "sessionTtlMinutes": 30,
   "toolOutputMaxChars": 50000,
   "toolPollWarningThreshold": 3,
+  "maxConsecutiveNoProgressInferences": 3,
   "maxConsecutiveToolPollInferences": 0,
   "pricingRefreshMinutes": 10,
   "requestTimeoutMs": 120000,

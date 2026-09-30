@@ -14,13 +14,20 @@ export interface SessionUsage {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  cachedTokens?: number;
 }
 
 export interface PendingToolCall {
   callId: string;
   tool: NormalizedTool;
+  toolCallFingerprint?: string;
   stagedOutput?: string;
   pollIdentityHash?: string;
+}
+
+export interface NoProgressSequence {
+  fingerprint: string;
+  consecutiveResults: number;
 }
 
 export interface ActiveToolPollSequence {
@@ -54,8 +61,63 @@ export interface ContextObservability {
   currentInputBytes: number;
   toolCatalogBytes: number;
   acceptedToolOutputReplayBytes: number;
+  instructionBytes: number;
+  sessionMetadataBytes: number;
+  protocolWrapperBytes: number;
+  encodedImageBytes: number;
+  sourceImageBytes: number;
   currentActiveContextBytes: number;
   peakActiveContextBytes: number;
+  peakPayloadBytes: number;
+}
+
+export type InferenceReason =
+  | "initial_turn"
+  | "conversation_continuation"
+  | "tool_result"
+  | "compaction"
+  | "compaction_continuation"
+  | "prewarm"
+  | "memory"
+  | "protocol_repair"
+  | "other";
+
+export interface InferenceTraceSummary {
+  inferenceNumber: number;
+  reason: InferenceReason;
+  requestClassification: RequestClassification;
+  requestKind?: string;
+  startedAt: number;
+  payloadBytes: number;
+  instructionBytes: number;
+  canonicalHistoryBytes: number;
+  currentInputBytes: number;
+  toolCatalogBytes: number;
+  acceptedToolOutputBytes: number;
+  sessionMetadataBytes: number;
+  protocolWrapperBytes: number;
+  encodedImageBytes: number;
+  sourceImageBytes: number;
+  requestSerializationMs: number;
+  providerWaitMs?: number;
+  responseParseMs?: number;
+  resultProcessingMs?: number;
+  totalElapsedMs?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedTokens?: number;
+  totalTokens?: number;
+  failureCode?: string;
+}
+
+export interface PerformanceObservability {
+  providerWaitMs: number;
+  responseParseMs: number;
+  resultProcessingMs: number;
+  requestSerializationMs: number;
+  peakInferenceInputTokens: number;
+  reasonCounts: Record<InferenceReason, number>;
+  traces: InferenceTraceSummary[];
 }
 
 export type RecoverableLimitName =
@@ -102,6 +164,13 @@ export interface PreparedToolOutputs {
   historical: CompletedToolCall[];
 }
 
+export interface VerifiedSessionModelIdentity {
+  source: "bridge_session";
+  agentRuntime: "Codex";
+  providerBridge: "EVREN";
+  upstreamInferenceModel: string;
+}
+
 export interface Session {
   id: string;
   threadIdentityHash?: string;
@@ -119,6 +188,7 @@ export interface Session {
   nativeHistory: NativeEvrenInputItem[];
   context: ContextWindowState;
   contextObservability: ContextObservability;
+  performanceObservability: PerformanceObservability;
   acceptedCompactionCount: number;
   pendingCompaction?: PendingCompaction;
   limitRecovery?: LimitRecoveryState;
@@ -128,6 +198,8 @@ export interface Session {
   completedToolCalls: Map<string, CompletedToolCall>;
   tools: Map<string, NormalizedTool>;
   polling: SessionPolling;
+  modelIdentity?: VerifiedSessionModelIdentity;
+  noProgress?: NoProgressSequence;
 }
 
 export class UnknownPreviousResponseError extends Error {
@@ -199,8 +271,33 @@ export class SessionStore {
         currentInputBytes: 0,
         toolCatalogBytes: 0,
         acceptedToolOutputReplayBytes: 0,
+        instructionBytes: 0,
+        sessionMetadataBytes: 0,
+        protocolWrapperBytes: 0,
+        encodedImageBytes: 0,
+        sourceImageBytes: 0,
         currentActiveContextBytes: 0,
         peakActiveContextBytes: 0,
+        peakPayloadBytes: 0,
+      },
+      performanceObservability: {
+        providerWaitMs: 0,
+        responseParseMs: 0,
+        resultProcessingMs: 0,
+        requestSerializationMs: 0,
+        peakInferenceInputTokens: 0,
+        reasonCounts: {
+          initial_turn: 0,
+          conversation_continuation: 0,
+          tool_result: 0,
+          compaction: 0,
+          compaction_continuation: 0,
+          prewarm: 0,
+          memory: 0,
+          protocol_repair: 0,
+          other: 0,
+        },
+        traces: [],
       },
       acceptedCompactionCount: 0,
       responseIds: new Set(),
@@ -286,6 +383,32 @@ export class SessionStore {
     this.callToSession.set(pending.callId, session.id);
   }
 
+  adoptHistoricalToolCall(session: Session, completed: { callId: string; toolName: string; output: string }): void {
+    const pendingSessionId = this.callToSession.get(completed.callId);
+    const completedSessionId = this.completedCallToSession.get(completed.callId);
+    if ((pendingSessionId && pendingSessionId !== session.id) || (completedSessionId && completedSessionId !== session.id)) {
+      throw new InvalidToolCallSessionError(`Tool output references call_id from a different session: ${completed.callId}`);
+    }
+    const existing = session.completedToolCalls.get(completed.callId);
+    const outputDigest = digestToolOutput(completed.output);
+    if (existing) {
+      if (existing.toolName !== completed.toolName || existing.outputDigest !== outputDigest) {
+        throw new InvalidToolCallSessionError(`Completed tool output changed while replaying call_id: ${completed.callId}`);
+      }
+      return;
+    }
+    if (session.pendingToolCalls.has(completed.callId)) {
+      throw new InvalidToolCallSessionError(`Tool output references active call_id during history adoption: ${completed.callId}`);
+    }
+    session.completedToolCalls.set(completed.callId, {
+      callId: completed.callId,
+      toolName: completed.toolName,
+      outputDigest,
+    });
+    this.completedCallToSession.set(completed.callId, session.id);
+    session.lastActivity = this.now();
+  }
+
   resolveByToolCallIds(callIds: readonly string[]): Session {
     this.prune();
     if (callIds.length === 0) {
@@ -315,13 +438,13 @@ export class SessionStore {
     return resolved;
   }
 
-  resolveByCanonicalReplay(entries: ReadonlyArray<{ role: "user" | "assistant"; text: string }>): Session | undefined {
+  resolveByCanonicalReplay(entries: ReadonlyArray<{ role: "developer" | "user" | "assistant"; text: string }>): Session | undefined {
     this.prune();
     if (!entries.some((entry) => entry.role === "assistant")) return undefined;
 
     const candidates = [...this.sessions.values()].filter((session) => {
       const canonical = session.transcript.filter((entry) =>
-        (entry.role === "user" || entry.role === "assistant")
+        (entry.role === "developer" || entry.role === "user" || entry.role === "assistant")
         && entry.callId === undefined
         && entry.toolName === undefined,
       );
@@ -449,6 +572,9 @@ export class SessionStore {
     session.usage.inputTokens += usage.inputTokens;
     session.usage.outputTokens += usage.outputTokens;
     session.usage.totalTokens += usage.totalTokens;
+    if (usage.cachedTokens !== undefined) {
+      session.usage.cachedTokens = (session.usage.cachedTokens ?? 0) + usage.cachedTokens;
+    }
     addUsage(session.usageByClass[classification], usage);
     session.lastActivity = this.now();
     return true;

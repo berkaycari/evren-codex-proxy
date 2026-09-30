@@ -1,5 +1,7 @@
 import type { NormalizedCodexRequest, NormalizedToolChoice } from "./normalize-codex-request.js";
 import type { NormalizedTool } from "./tool-protocol.js";
+import type { VerifiedSessionModelIdentity } from "../sessions/store.js";
+import { renderVerifiedSessionModelIdentity } from "./codex-to-evren.js";
 
 export type NativeEvrenInputItem = Record<string, unknown>;
 
@@ -33,11 +35,19 @@ export function buildNativeEvrenRequest(
   history: readonly NativeEvrenInputItem[],
   model: string,
   maxOutputTokens: number,
+  modelIdentity: VerifiedSessionModelIdentity,
 ): NativeEvrenRequest {
   const tools = selectToolsForInference(request.toolChoice, request.tools);
+  const identityMessage = nativeMessage("developer", renderVerifiedSessionModelIdentity(modelIdentity));
+  const firstNonDeveloper = history.findIndex((item) => item.type !== "message" || item.role !== "developer");
+  const identityIndex = firstNonDeveloper === -1 ? history.length : firstNonDeveloper;
   return {
     model,
-    input: [...history],
+    input: [
+      ...history.slice(0, identityIndex),
+      identityMessage,
+      ...history.slice(identityIndex),
+    ],
     tools: tools.map(toNativeFunctionTool),
     tool_choice: translateToolChoice(request.toolChoice, request.tools),
     parallel_tool_calls: request.parallelToolCalls,
@@ -107,11 +117,15 @@ export class InvalidNativeToolChoiceError extends Error {
   readonly code = "invalid_request_error";
 }
 
-export function nativeMessage(role: "developer" | "user" | "assistant", text: string): NativeEvrenInputItem {
+export function nativeMessage(
+  role: "developer" | "user" | "assistant",
+  text: string,
+  content?: Array<Record<string, unknown>>,
+): NativeEvrenInputItem {
   return {
     type: "message",
     role,
-    content: [{ type: role === "assistant" ? "output_text" : "input_text", text }],
+    content: content?.length ? content : [{ type: role === "assistant" ? "output_text" : "input_text", text }],
   };
 }
 

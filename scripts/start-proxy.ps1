@@ -7,7 +7,10 @@ $ErrorActionPreference = 'Stop'
 # EVREN CODEX BRIDGE - Terminal Theme
 # ─────────────────────────────────────────────────────────────
 
-$Host.UI.RawUI.WindowTitle = 'EVREN CODEX BRIDGE · v1.3.0'
+$projectRoot = Split-Path -Parent $PSScriptRoot
+$packageMetadata = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'package.json') | ConvertFrom-Json
+$productVersion = [string]$packageMetadata.version
+$Host.UI.RawUI.WindowTitle = "EVREN CODEX BRIDGE · v$productVersion"
 
 function global:prompt {
     $time = Get-Date -Format 'HH:mm:ss'
@@ -30,7 +33,8 @@ Clear-Host
 Write-Host ''
 Write-Host '╭──────────────────────────────────────────────────────────╮' -ForegroundColor DarkCyan
 Write-Host '│' -NoNewline -ForegroundColor DarkCyan
-Write-Host '             EVREN CODEX BRIDGE · v1.3.0                  ' -NoNewline -ForegroundColor Cyan
+$title = "EVREN CODEX BRIDGE · v$productVersion"
+Write-Host $title.PadLeft(44).PadRight(58) -NoNewline -ForegroundColor Cyan
 Write-Host '│' -ForegroundColor DarkCyan
 Write-Host '├──────────────────────────────────────────────────────────┤' -ForegroundColor DarkCyan
 Write-Host '│  LOCAL AI COMPATIBILITY PROXY                            │' -ForegroundColor DarkCyan
@@ -39,8 +43,6 @@ Write-Host '│  Model   : deepseek-v4.1-flash                           │' -F
 Write-Host '│  Runtime : Codex → Proxy → EVREN                         │' -ForegroundColor DarkCyan
 Write-Host '╰──────────────────────────────────────────────────────────╯' -ForegroundColor DarkCyan
 Write-Host ''
-
-$projectRoot = Split-Path -Parent $PSScriptRoot
 
 # ─────────────────────────────────────────────────────────────
 # EVREN API Key Loading
@@ -121,7 +123,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $projectRoot 'dist\index.js'))) {
 
 Push-Location $projectRoot
 try {
-    & npm.cmd start
+    & npm.cmd run bridge
     exit $LASTEXITCODE
 }
 finally {

@@ -100,6 +100,6 @@ export class RetryCircuitBlockedError extends Error {
   }
 }
 
-export function fingerprintNativeEvrenRequest(request: NativeEvrenRequest): string {
-  return createHash("sha256").update(JSON.stringify(request), "utf8").digest("hex");
+export function fingerprintNativeEvrenRequest(request: NativeEvrenRequest, serializedRequest?: string): string {
+  return createHash("sha256").update(serializedRequest ?? JSON.stringify(request), "utf8").digest("hex");
 }

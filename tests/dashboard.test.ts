@@ -17,6 +17,28 @@ import {
 import { SafeLogger } from "../src/ui/logger.js";
 import { SessionStore } from "../src/sessions/store.js";
 
+function emptyPerformanceObservability() {
+  return {
+    providerWaitMs: 0,
+    responseParseMs: 0,
+    resultProcessingMs: 0,
+    requestSerializationMs: 0,
+    peakInferenceInputTokens: 0,
+    reasonCounts: {
+      initial_turn: 0,
+      conversation_continuation: 0,
+      tool_result: 0,
+      compaction: 0,
+      compaction_continuation: 0,
+      prewarm: 0,
+      memory: 0,
+      protocol_repair: 0,
+      other: 0,
+    },
+    traces: [],
+  };
+}
+
 const snapshot: DashboardSnapshot = {
   status: "ONLINE",
   listen: "127.0.0.1:8787",
@@ -287,9 +309,16 @@ describe("dashboard", () => {
         currentInputBytes: 0,
         toolCatalogBytes: 0,
         acceptedToolOutputReplayBytes: 0,
+        instructionBytes: 0,
+        sessionMetadataBytes: 0,
+        protocolWrapperBytes: 0,
+        encodedImageBytes: 0,
+        sourceImageBytes: 0,
         currentActiveContextBytes: 0,
         peakActiveContextBytes: 0,
+        peakPayloadBytes: 0,
       },
+      performanceObservability: emptyPerformanceObservability(),
       acceptedCompactionCount: 0,
       responseIds: new Set<string>(),
       accountedEvrenResponseIds: new Set<string>(),
@@ -345,9 +374,16 @@ describe("dashboard", () => {
         currentInputBytes: 0,
         toolCatalogBytes: 0,
         acceptedToolOutputReplayBytes: 0,
+        instructionBytes: 0,
+        sessionMetadataBytes: 0,
+        protocolWrapperBytes: 0,
+        encodedImageBytes: 0,
+        sourceImageBytes: 0,
         currentActiveContextBytes: 0,
         peakActiveContextBytes: 0,
+        peakPayloadBytes: 0,
       },
+      performanceObservability: emptyPerformanceObservability(),
       acceptedCompactionCount: 0,
       responseIds: new Set<string>(),
       accountedEvrenResponseIds: new Set<string>(),

@@ -9,9 +9,10 @@ import { PricingBlockedError } from "../safety/pricing-guard.js";
 import { ConflictingSessionIdentityError, InvalidToolCallSessionError, UnknownPreviousResponseError } from "../sessions/store.js";
 import { AccountingUncertainError } from "../usage/tracker.js";
 import { RetryCircuitBlockedError } from "../safety/deterministic-retry-circuit.js";
-import { ToolPollLimitError } from "../bridge/tool-polling.js";
+import { NoProgressLoopError, ToolPollLimitError } from "../bridge/tool-polling.js";
 import type { EventSink } from "../ui/logger.js";
 import { CreditBudgetUnsupportedError, CreditFloorExceededError } from "../safety/credit-policy.js";
+import { EvrenUpstreamError } from "../evren/client.js";
 
 export function registerResponsesRoute(
   app: FastifyInstance,
@@ -19,8 +20,15 @@ export function registerResponsesRoute(
   logger: EventSink,
 ): void {
   app.post("/v1/responses", async (request, reply) => {
+    const controller = new AbortController();
+    const abort = (): void => controller.abort();
+    const abortIfReplyClosed = (): void => {
+      if (!reply.raw.writableEnded) controller.abort();
+    };
+    request.raw.once("aborted", abort);
+    reply.raw.once("close", abortIfReplyClosed);
     try {
-      const result = await bridge.handle(request.body);
+      const result = await bridge.handle(request.body, controller.signal);
       if (result.stream) {
         return reply
           .header("content-type", "text/event-stream; charset=utf-8")
@@ -35,7 +43,11 @@ export function registerResponsesRoute(
         level: "error",
         message: error instanceof Error ? error.message : "Unknown bridge error.",
       });
+      if (reply.raw.destroyed) return reply;
       return sendError(reply, error);
+    } finally {
+      request.raw.off("aborted", abort);
+      reply.raw.off("close", abortIfReplyClosed);
     }
   });
 }
@@ -50,7 +62,8 @@ function sendError(reply: FastifyReply, error: unknown): FastifyReply {
     || error instanceof UnknownPreviousResponseError
     || error instanceof ConflictingSessionIdentityError
     || error instanceof InvalidToolCallSessionError
-    || error instanceof ToolPollLimitError) {
+    || error instanceof ToolPollLimitError
+    || error instanceof NoProgressLoopError) {
     status = 400;
     type = "invalid_request_error";
     code = error.code;
@@ -85,6 +98,11 @@ function sendError(reply: FastifyReply, error: unknown): FastifyReply {
     type = "upstream_protocol_error";
     code = error.code;
     message = error.message;
+  } else if (error instanceof EvrenUpstreamError) {
+    status = upstreamStatus(error);
+    type = upstreamType(error);
+    code = error.code;
+    message = error.message;
   } else if (error instanceof Error) {
     message = error.message;
   }
@@ -98,11 +116,55 @@ function sendError(reply: FastifyReply, error: unknown): FastifyReply {
     }
     : error instanceof CreditFloorExceededError
       ? { remaining: error.remaining, minimum: error.minimum, recoverable: false }
+      : error instanceof EvrenUpstreamError
+        ? {
+          retryable: error.options.retryable,
+          ...(error.options.retryAfterMs === undefined ? {} : { retry_after_ms: error.options.retryAfterMs }),
+        }
       : {};
   const helpfulMessage = error instanceof LimitExceededError && error.recoverable
     ? `${message} Local EVREN Bridge limit reached; ${error.inferenceMade ? "authoritative usage was recorded before the post-response limit check" : "no additional EVREN inference was made"}. No failed request is replayed automatically. In the Bridge terminal press R to raise only the recommended limit, or use F1 -> C. Then return to Codex and continue the task.`
     : message;
+  if (error instanceof EvrenUpstreamError && error.options.retryAfterMs !== undefined) {
+    reply.header("retry-after", Math.max(0, Math.ceil(error.options.retryAfterMs / 1_000)).toString());
+  }
   return reply.status(status).send({
     error: { message: helpfulMessage, type, param: null, code, ...details },
   });
+}
+
+function upstreamStatus(error: EvrenUpstreamError): number {
+  switch (error.category) {
+    case "authentication": return 401;
+    case "authorization": return 403;
+    case "invalid_request": return 400;
+    case "unsupported_model": return 404;
+    case "unsupported_media": return 415;
+    case "payload_too_large": return 413;
+    case "rate_limit": return 429;
+    case "provider_overload": return 503;
+    case "network": return 503;
+    case "timeout": return 504;
+    case "aborted": return 499;
+    case "provider_error":
+    case "malformed_response": return 502;
+  }
+}
+
+function upstreamType(error: EvrenUpstreamError): string {
+  switch (error.category) {
+    case "authentication": return "authentication_error";
+    case "authorization": return "permission_error";
+    case "invalid_request":
+    case "unsupported_model":
+    case "unsupported_media":
+    case "payload_too_large": return "invalid_request_error";
+    case "rate_limit": return "rate_limit_error";
+    case "timeout": return "timeout_error";
+    case "aborted": return "request_aborted";
+    case "provider_overload":
+    case "provider_error":
+    case "network":
+    case "malformed_response": return "upstream_error";
+  }
 }

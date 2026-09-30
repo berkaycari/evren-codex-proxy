@@ -23,6 +23,7 @@ export interface BridgeConfig {
   sessionTtlMinutes: number;
   toolOutputMaxChars: number;
   toolPollWarningThreshold: number;
+  maxConsecutiveNoProgressInferences: number;
   maxConsecutiveToolPollInferences: number;
   pricingRefreshMinutes: number;
   requestTimeoutMs: number;
@@ -40,6 +41,7 @@ const ENV_NUMBERS: Record<string, keyof BridgeConfig> = {
   SESSION_TTL_MINUTES: "sessionTtlMinutes",
   TOOL_OUTPUT_MAX_CHARS: "toolOutputMaxChars",
   TOOL_POLL_WARNING_THRESHOLD: "toolPollWarningThreshold",
+  MAX_CONSECUTIVE_NO_PROGRESS_INFERENCES: "maxConsecutiveNoProgressInferences",
   MAX_CONSECUTIVE_TOOL_POLL_INFERENCES: "maxConsecutiveToolPollInferences",
   PRICING_REFRESH_MINUTES: "pricingRefreshMinutes",
   EVREN_REQUEST_TIMEOUT_MS: "requestTimeoutMs",
@@ -66,6 +68,7 @@ const LOCAL_NUMBER_KEYS = [
 ] as const satisfies ReadonlyArray<keyof BridgeConfig>;
 
 const LOCAL_NON_NEGATIVE_NUMBER_KEYS = [
+  "maxConsecutiveNoProgressInferences",
   "maxConsecutiveToolPollInferences",
 ] as const satisfies ReadonlyArray<keyof BridgeConfig>;
 

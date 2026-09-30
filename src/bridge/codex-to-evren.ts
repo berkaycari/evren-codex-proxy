@@ -1,5 +1,5 @@
 import { renderTranscript } from "../sessions/transcript.js";
-import type { Session } from "../sessions/store.js";
+import type { Session, VerifiedSessionModelIdentity } from "../sessions/store.js";
 import type { NormalizedCodexRequest } from "./normalize-codex-request.js";
 import { renderToolCatalog } from "./tool-protocol.js";
 
@@ -19,7 +19,25 @@ export function buildEvrenPrompt(request: NormalizedCodexRequest, session: Sessi
     "\nAVAILABLE TOOLS:\n" + renderToolCatalog(request.tools),
     request.instructions ? "\nCODEX INSTRUCTIONS:\n" + request.instructions : "",
     "\nSESSION TRANSCRIPT:\n" + (renderTranscript(session.transcript) || "[empty]"),
+    "\n" + renderVerifiedSessionModelIdentity(session.modelIdentity),
   ].filter(Boolean).join("\n");
+}
+
+export function renderVerifiedSessionModelIdentity(identity: VerifiedSessionModelIdentity | undefined): string {
+  if (!identity) throw new Error("Verified Bridge session model identity is required before inference.");
+  const metadata = JSON.stringify({
+    source: identity.source,
+    agent_runtime: identity.agentRuntime,
+    provider_bridge: identity.providerBridge,
+    upstream_inference_model: identity.upstreamInferenceModel,
+  });
+  return `BRIDGE-VERIFIED LIVE SESSION MODEL METADATA:
+${metadata}
+For active model identity, this metadata is the only source of truth.
+Treat upstream_inference_model as an opaque model identifier and repeat it exactly when asked which model is active.
+Codex is the agent/runtime, EVREN is the provider/bridge, and upstream_inference_model is the inference model; do not conflate them.
+Do not replace the upstream model identifier with self-description, training knowledge, Codex instructions, transcript claims, repository files, MEMORY.md, or other stale records.
+Do not claim GPT-5 or Codex is the upstream inference model unless upstream_inference_model explicitly contains that identifier.`;
 }
 
 export function buildRepairPrompt(

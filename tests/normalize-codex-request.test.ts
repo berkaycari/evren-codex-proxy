@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { normalizeCodexRequest } from "../src/bridge/normalize-codex-request.js";
+import { buildNativeEvrenRequest, nativeMessage } from "../src/bridge/native-codex-to-evren.js";
 
 describe("Codex request normalization", () => {
   it("exposes call_ids from every supported tool output type", () => {
@@ -13,9 +14,9 @@ describe("Codex request normalization", () => {
 
     expect(request.toolOutputCallIds).toEqual(["call_function", "call_custom", "call_mcp"]);
     expect(request.entries).toEqual([
-      { role: "tool", callId: "call_function", text: "one" },
-      { role: "tool", callId: "call_custom", text: "two" },
-      { role: "tool", callId: "call_mcp", text: "three" },
+      { role: "tool", callId: "call_function", text: "one", inputIndex: 0 },
+      { role: "tool", callId: "call_custom", text: "two", inputIndex: 1 },
+      { role: "tool", callId: "call_mcp", text: "three", inputIndex: 2 },
     ]);
   });
 
@@ -27,7 +28,7 @@ describe("Codex request normalization", () => {
         { type: "message", role: "user", content: "safe user text" },
       ],
     });
-    expect(request.entries).toEqual([{ role: "user", text: "safe user text" }]);
+    expect(request.entries).toEqual([{ role: "user", text: "safe user text", inputIndex: 2 }]);
     expect(JSON.stringify(request)).not.toContain("private chain");
   });
 
@@ -101,5 +102,90 @@ describe("Codex request normalization", () => {
       contextWindowId: "context_ok",
     });
     expect(JSON.stringify(request)).not.toContain("workspaces");
+  });
+
+  it("preserves supported input_image data in the native Responses request", () => {
+    const imageUrl = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB";
+    const request = normalizeCodexRequest({
+      model: "image-model",
+      input: [{
+        type: "message",
+        role: "user",
+        content: [
+          { type: "input_text", text: "Bu görseli incele" },
+          { type: "input_image", image_url: imageUrl, detail: "auto" },
+        ],
+      }],
+    });
+    expect(request.entries[0]?.text).toContain("[input_image sha256:");
+    expect(request.entries[0]?.text).not.toContain(imageUrl);
+    const entry = request.entries[0]!;
+    const native = buildNativeEvrenRequest(
+      request,
+      [nativeMessage("user", entry.text, entry.nativeContent)],
+      "image-model",
+      1_000,
+      {
+        source: "bridge_session",
+        agentRuntime: "Codex",
+        providerBridge: "EVREN",
+        upstreamInferenceModel: "image-model",
+      },
+    );
+    expect(native.input.find((item) => item.role === "user")).toMatchObject({
+      type: "message",
+      role: "user",
+      content: [
+        { type: "input_text", text: "Bu görseli incele" },
+        { type: "input_image", image_url: imageUrl, detail: "auto" },
+      ],
+    });
+    expect(JSON.stringify(native)).not.toContain("input_image omitted");
+  });
+
+  it("preserves image-only and multiple-image requests without inserting prompt placeholders", () => {
+    const first = "data:image/png;base64,iVBORw0KGgoAAA==";
+    const second = "data:image/webp;base64,UklGRgAAAAA=";
+    const request = normalizeCodexRequest({
+      input: [{ type: "message", role: "user", content: [
+        { type: "input_image", image_url: first },
+        { type: "input_image", image_url: second, detail: "low" },
+      ] }],
+    });
+    expect(request.entries[0]?.nativeContent).toEqual([
+      { type: "input_image", image_url: first },
+      { type: "input_image", image_url: second, detail: "low" },
+    ]);
+    expect(JSON.stringify(request.entries[0]?.nativeContent)).not.toContain("omitted");
+  });
+
+  it("rejects unsupported image MIME and malformed base64 before upstream inference", () => {
+    expect(() => normalizeCodexRequest({ input: [{
+      type: "message", role: "user", content: [{ type: "input_image", image_url: "data:image/gif;base64,R0lGODlh" }],
+    }] })).toThrow("supports only PNG, JPEG, or WebP");
+    expect(() => normalizeCodexRequest({ input: [{
+      type: "message", role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,%%%" }],
+    }] })).toThrow("base64 data URL");
+  });
+
+  it("preserves developer/system semantics and fails unknown input structures explicitly", () => {
+    const request = normalizeCodexRequest({ input: [
+      { type: "message", role: "system", content: [{ type: "input_text", text: "policy" }] },
+      { type: "message", role: "developer", content: "contract" },
+      { type: "message", role: "user", content: "task" },
+    ] });
+    expect(request.entries.map((entry) => entry.role)).toEqual(["developer", "developer", "user"]);
+    expect(() => normalizeCodexRequest({ input: [{ type: "future_magic", payload: "do not stringify" }] }))
+      .toThrow("Unsupported Responses input item");
+    expect(() => normalizeCodexRequest({ input: { prompt: "do not coerce" } }))
+      .toThrow("input must be a string or an array");
+  });
+
+  it("rejects multimodal tool outputs instead of silently replacing them with text", () => {
+    expect(() => normalizeCodexRequest({ input: [{
+      type: "function_call_output",
+      call_id: "call-1",
+      output: [{ type: "input_image", image_url: "data:image/png;base64,iVBORw0KGgoAAA==" }],
+    }] })).toThrow("not supported inside a tool output");
   });
 });

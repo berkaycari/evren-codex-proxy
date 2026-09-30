@@ -70,6 +70,7 @@ export class SafeLogger implements EventSink {
   private readonly recent: RecentLogEvent[] = [];
   private readonly listeners = new Set<() => void>();
   private lastToolActivity: { key: string; source: "native" | "canonical"; at: number } | undefined;
+  private writeQueue: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly logsDir: string,
@@ -101,7 +102,7 @@ export class SafeLogger implements EventSink {
       target(`[${timestamp}] ${entry.event}${suffix}`);
     }
 
-    void this.persist(safe).catch(() => {
+    this.writeQueue = this.writeQueue.then(() => this.persist(safe)).catch(() => {
       if (this.consoleEnabled) console.error(`[${timestamp}] LOG_WRITE_ERROR`);
     });
     for (const listener of this.listeners) {
@@ -120,6 +121,10 @@ export class SafeLogger implements EventSink {
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  async flush(): Promise<void> {
+    await this.writeQueue;
   }
 
   private async persist(entry: Record<string, unknown>): Promise<void> {

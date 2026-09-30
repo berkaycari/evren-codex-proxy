@@ -1,31 +1,114 @@
 {
   "name": "evren-codex-bridge",
-  "version": "1.3.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Local compatibility bridge between OpenAI Codex CLI and the EVREN Responses API.",
+  "description": "EVREN Codex Bridge secure Windows desktop coding agent and local compatibility bridge.",
+  "main": "dist/desktop/main/index.js",
   "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "start": "node dist/index.js",
-    "dev": "tsx src/index.ts",
-    "build": "tsc -p tsconfig.build.json",
+    "start": "npm run desktop",
+    "desktop": "npm run desktop:build && electron .",
+    "desktop:dev": "node scripts/desktop-dev.mjs",
+    "desktop:build": "npm run build",
+    "bridge": "node dist/index.js",
+    "bridge:dev": "tsx src/index.ts",
+    "dev": "npm run desktop:dev",
+    "core:build": "tsc -p tsconfig.build.json",
+    "preload:build": "vite build --config vite.preload.config.ts",
+    "renderer:build": "vite build --config vite.desktop.config.ts",
+    "build": "npm run core:build && npm run preload:build && npm run renderer:build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "benchmark:performance": "tsx scripts/benchmark-performance.ts",
+    "smoke:codex-app-server": "node scripts/smoke-codex-app-server.mjs",
+    "smoke:desktop": "node scripts/smoke-desktop.mjs",
+    "smoke:packaged": "node scripts/smoke-packaged.mjs",
+    "smoke:portable": "node scripts/smoke-packaged.mjs --portable",
+    "smoke:bundled-codex": "node scripts/smoke-bundled-codex.mjs",
+    "desktop:package": "npm run brand:icons && npm run build && electron-builder --win --x64 --dir",
+    "desktop:dist": "npm run brand:icons && npm run build && electron-builder --win nsis portable --x64",
+    "brand:icons": "node scripts/generate-brand-icons.mjs",
     "smoke:evren": "tsx scripts/smoke-evren.ts"
   },
   "dependencies": {
     "ajv": "^8.17.1",
+    "electron-updater": "^6.8.9",
     "fastify": "^5.6.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
     "zod": "^4.1.11"
   },
   "devDependencies": {
     "@types/node": "^24.5.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "electron": "^44.3.0",
+    "electron-builder": "^26.15.3",
     "tsx": "^4.20.6",
     "typescript": "^5.9.2",
+    "vite": "^7.3.6",
     "vitest": "^3.2.4"
+  },
+  "build": {
+    "appId": "tr.org.ssyz.evren.codex",
+    "productName": "EVREN Codex Bridge",
+    "asar": true,
+    "npmRebuild": false,
+    "directories": {
+      "output": "dist-release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-desktop/**/*",
+      "config/defaults.json",
+      "resources/branding/**/*",
+      "package.json",
+      "LICENSE",
+      "!**/*.map",
+      "!tests{,/**/*}",
+      "!benchmarks{,/**/*}",
+      "!docs{,/**/*}",
+      "!scripts{,/**/*}",
+      "!src{,/**/*}"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/codex",
+        "to": "codex"
+      }
+    ],
+    "win": {
+      "icon": "resources/branding/evren-codex-bridge.ico",
+      "executableName": "EVREN Codex Bridge",
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "portable", "arch": ["x64"] }
+      ],
+      "artifactName": "EVREN-Codex-Bridge-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "artifactName": "EVREN-Codex-Bridge-Setup-${version}.${ext}",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "EVREN Codex Bridge",
+      "runAfterFinish": false
+    },
+    "portable": {
+      "artifactName": "EVREN-Codex-Bridge-Portable-${version}.${ext}"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "berkaycari",
+      "repo": "evren-codex-proxy",
+      "releaseType": "release"
+    }
   }
 }

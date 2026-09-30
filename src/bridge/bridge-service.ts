@@ -1,5 +1,10 @@
 import type { BridgeConfig } from "../config.js";
-import type { EvrenNativeResult, EvrenTransport } from "../evren/client.js";
+import type {
+  EvrenNativeResult,
+  EvrenRequestContext,
+  EvrenResponseTiming,
+  EvrenTransport,
+} from "../evren/client.js";
 import type { EvrenUsage } from "../evren/extract-response.js";
 import { assertPostUsageAllowed, assertRequestAllowed, assertToolCallAllowed, assertToolCallsAllowed, LimitExceededError } from "../safety/limits.js";
 import { assertCreditPolicyAllowed } from "../safety/credit-policy.js";
@@ -14,8 +19,11 @@ import { estimateInputTokens } from "../safety/token-estimator.js";
 import {
   InvalidToolCallSessionError,
   type PreparedToolOutputs,
+  type InferenceReason,
+  type InferenceTraceSummary,
   type Session,
   type SessionStore,
+  type VerifiedSessionModelIdentity,
 } from "../sessions/store.js";
 import type { UsageTracker } from "../usage/tracker.js";
 import type { EventSink } from "../ui/logger.js";
@@ -32,7 +40,13 @@ import {
 import { parseNativeEvrenResponse } from "./native-evren-to-codex.js";
 import { normalizeCodexRequest, InvalidRequestError, type NormalizedCodexRequest } from "./normalize-codex-request.js";
 import { parseModelDecision, ToolProtocolError, type ModelDecision, type NormalizedTool } from "./tool-protocol.js";
-import { recognizeToolPoll, ToolPollLimitError } from "./tool-polling.js";
+import {
+  fingerprintToolCall,
+  fingerprintToolResult,
+  NoProgressLoopError,
+  recognizeToolPoll,
+  ToolPollLimitError,
+} from "./tool-polling.js";
 
 export interface BridgeResult extends BuiltCodexResponse {
   stream: boolean;
@@ -60,7 +74,18 @@ interface InferenceMetrics {
   currentInputBytes: number;
   toolCatalogBytes: number;
   acceptedToolOutputBytes: number;
+  sessionMetadataBytes: number;
+  protocolWrapperBytes: number;
+  encodedImageBytes: number;
+  sourceImageBytes: number;
   requestClassification: RequestClassification;
+  reason: InferenceReason;
+  requestKind?: string;
+  startedAt: number;
+  requestSerializationMs: number;
+  providerReturnedAt?: number;
+  clientResultProcessingMs: number;
+  trace: InferenceTraceSummary;
 }
 
 interface ContextBoundary {
@@ -79,20 +104,42 @@ export class BridgeService {
     usage: UsageTracker;
     logger: EventSink;
     retryCircuit?: DeterministicRetryCircuit;
+    requireRequestedModel?: boolean;
   }) {
     this.retryCircuit = deps.retryCircuit ?? new DeterministicRetryCircuit();
   }
 
-  async handle(body: unknown): Promise<BridgeResult> {
+  async handle(body: unknown, abortSignal?: AbortSignal): Promise<BridgeResult> {
     const request = normalizeCodexRequest(body);
+    if (abortSignal) request.abortSignal = abortSignal;
+    if (this.deps.requireRequestedModel && request.model === undefined) {
+      throw new InvalidRequestError("Desktop Codex request did not include an explicit model.");
+    }
+    if (request.model !== undefined && request.model !== this.deps.config.model) {
+      throw new InvalidRequestError("Requested model does not match the active Desktop Bridge model.");
+    }
+    const effectiveUpstreamModel = this.deps.client.getEffectiveModel?.();
+    if (effectiveUpstreamModel !== undefined && effectiveUpstreamModel !== this.deps.config.model) {
+      throw new InvalidRequestError("Effective upstream model does not match the active Desktop Bridge model.");
+    }
     const resolved = this.resolveSession(request);
     const session = resolved.session;
+    const modelIdentity = {
+      source: "bridge_session",
+      agentRuntime: "Codex",
+      providerBridge: "EVREN",
+      upstreamInferenceModel: effectiveUpstreamModel ?? this.deps.config.model,
+    } as const;
+    session.modelIdentity = modelIdentity;
     const compactionAdopted = this.adoptCompactedContext(session, request);
     const boundary: ContextBoundary = {
       nativeHistoryItems: session.nativeHistory.length,
       transcriptItems: session.transcript.length,
     };
     const classification = this.classifyIncoming(session, request, resolved.canonicalReplay, compactionAdopted);
+    const inferenceReason = classifyInferenceReason(request, classification);
+    this.recordNoProgressResult(session, classification);
+    this.assertNoProgressContinuationAllowed(session, classification);
     this.assertPollContinuationAllowed(session, classification);
 
     let activeToolCallIds: string[] = [];
@@ -117,8 +164,8 @@ export class BridgeService {
     const inferenceCountBefore = session.inferenceCount;
     try {
       const result = await (this.deps.config.toolTransport === "native"
-        ? this.handleNative(request, session, tools, activeToolCallIds, boundary)
-        : this.handleTextual(request, session, tools, activeToolCallIds, boundary));
+        ? this.handleNative(request, session, tools, activeToolCallIds, boundary, modelIdentity, inferenceReason)
+        : this.handleTextual(request, session, tools, activeToolCallIds, boundary, inferenceReason));
       this.recordSuccessfulWindowState(session, request);
       this.clearSatisfiedRecovery(session);
       return result;
@@ -156,14 +203,20 @@ export class BridgeService {
     tools: NormalizedTool[],
     activeToolCallIds: string[],
     boundary: ContextBoundary,
+    modelIdentity: VerifiedSessionModelIdentity,
+    inferenceReason: InferenceReason,
   ): Promise<BridgeResult> {
     const upstream = buildNativeEvrenRequest(
       request,
       session.nativeHistory,
       this.deps.config.model,
       this.deps.config.maxOutputTokensPerCall,
+      modelIdentity,
     );
-    const requestFingerprint = fingerprintNativeEvrenRequest(upstream);
+    const serializationStartedAt = performance.now();
+    const serializedUpstream = JSON.stringify(upstream);
+    const requestSerializationMs = performance.now() - serializationStartedAt;
+    const requestFingerprint = fingerprintNativeEvrenRequest(upstream, serializedUpstream);
     try {
       this.retryCircuit.assertAllowed(requestFingerprint);
     } catch (error) {
@@ -177,7 +230,6 @@ export class BridgeService {
       }
       throw error;
     }
-    const serializedUpstream = JSON.stringify(upstream);
     this.beginRequest(session, tools, serializedUpstream, request);
     const metrics = this.startInference(
       session,
@@ -185,9 +237,14 @@ export class BridgeService {
       upstream.input.length,
       upstream.tools.length,
       request.requestClassification,
-      nativePayloadBreakdown(upstream, boundary.nativeHistoryItems),
+      nativePayloadBreakdown(upstream, boundary.nativeHistoryItems, serializedUpstream),
+      inferenceReason,
+      request.requestKind,
+      requestSerializationMs,
     );
-    const result = await this.respondAndAccount(session, upstream, metrics);
+    const result = await this.respondAndAccount(session, upstream, serializedUpstream, metrics, request);
+    const processingStartedAt = Date.now();
+    try {
     let decision: ReturnType<typeof parseNativeEvrenResponse>;
     try {
       decision = parseNativeEvrenResponse(result.raw, session.tools, request.parallelToolCalls);
@@ -275,6 +332,7 @@ export class BridgeService {
       this.deps.sessions.recordPendingToolCall(session, {
         callId: built.callId,
         tool,
+        toolCallFingerprint: fingerprintToolCall(decision.name, decision.arguments),
         ...(pollIdentityHash === undefined ? {} : { pollIdentityHash }),
       });
       session.nativeHistory.push(nativeFunctionCall(built.callId, decision.name, decision.argumentsJson));
@@ -300,6 +358,9 @@ export class BridgeService {
 
     this.completeActiveCalls(session, activeToolCallIds);
     return { ...built, stream: request.stream, session };
+    } finally {
+      this.completeInferenceProcessing(session, metrics, Date.now() - processingStartedAt);
+    }
   }
 
   private async handleTextual(
@@ -308,16 +369,25 @@ export class BridgeService {
     tools: NormalizedTool[],
     activeToolCallIds: string[],
     boundary: ContextBoundary,
+    inferenceReason: InferenceReason,
   ): Promise<BridgeResult> {
     const prompt = buildEvrenPrompt(request, session);
     this.beginRequest(session, tools, prompt, request);
     let decision: ModelDecision;
     let aggregate: EvrenUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
-    const first = await this.inferAndAccount(session, prompt, tools.length, request, boundary);
+    const first = await this.inferAndAccount(session, prompt, tools.length, request, boundary, inferenceReason);
     aggregate = addUsage(aggregate, first.usage);
+    const firstProcessingStartedAt = Date.now();
+    let firstProcessingCompleted = false;
+    const completeFirstProcessing = (): void => {
+      if (firstProcessingCompleted) return;
+      firstProcessingCompleted = true;
+      this.completeInferenceProcessing(session, first.metrics, Date.now() - firstProcessingStartedAt);
+    };
     try {
       decision = parseModelDecision(first.text, session.tools);
     } catch (error) {
+      completeFirstProcessing();
       if (!(error instanceof ToolProtocolError)) throw error;
       if (!error.repairable) {
         throw enrichSaturatedProtocolError(
@@ -335,9 +405,11 @@ export class BridgeService {
         tools.length,
         request,
         boundary,
+        "protocol_repair",
         opaqueCurrentInputBreakdown(repairPrompt),
       );
       aggregate = addUsage(aggregate, repaired.usage);
+      const repairProcessingStartedAt = Date.now();
       try {
         decision = parseModelDecision(repaired.text, session.tools);
       } catch (repairError) {
@@ -349,8 +421,11 @@ export class BridgeService {
           );
         }
         throw repairError;
+      } finally {
+        this.completeInferenceProcessing(session, repaired.metrics, Date.now() - repairProcessingStartedAt);
       }
     }
+    completeFirstProcessing();
 
     if (decision.kind === "tool_call") assertToolCallAllowed(this.deps.config, session);
     const pollIdentityHash = this.recordPollDecision(session, decision, aggregate);
@@ -363,6 +438,7 @@ export class BridgeService {
       this.deps.sessions.recordPendingToolCall(session, {
         callId: built.callId,
         tool,
+        toolCallFingerprint: fingerprintToolCall(decision.name, decision.arguments),
         ...(pollIdentityHash === undefined ? {} : { pollIdentityHash }),
       });
       session.transcript.push({
@@ -461,7 +537,7 @@ export class BridgeService {
         && entry.role === "assistant") continue;
       session.transcript.push({ role: entry.role, text: entry.text });
       if (this.deps.config.toolTransport === "native") {
-        session.nativeHistory.push(nativeMessage(entry.role, entry.text));
+        session.nativeHistory.push(nativeMessage(entry.role, entry.text, entry.nativeContent));
       }
     }
     return prepared.active.map((active) => active.callId);
@@ -538,17 +614,32 @@ export class BridgeService {
       if (threadId) this.deps.sessions.assertThreadAssociation(session, threadId);
       return { session, canonicalReplay: false };
     }
-    if (request.toolOutputCallIds.length > 0) {
-      const session = this.deps.sessions.resolveByToolCallIds(request.toolOutputCallIds);
-      if (threadId) this.deps.sessions.assertThreadAssociation(session, threadId);
-      return {
-        session,
-        canonicalReplay: false,
-      };
-    }
     if (threadId) {
       const threaded = this.deps.sessions.resolveByThreadId(threadId);
-      if (threaded) return { session: threaded, canonicalReplay: false };
+      if (threaded) {
+        if (request.toolOutputCallIds.length === 0) return { session: threaded, canonicalReplay: false };
+        try {
+          const byCalls = this.deps.sessions.resolveByToolCallIds(request.toolOutputCallIds);
+          this.deps.sessions.assertThreadAssociation(byCalls, threadId);
+          return { session: byCalls, canonicalReplay: false };
+        } catch (error) {
+          if (this.adoptHistoricalToolReplay(threaded, request)) return { session: threaded, canonicalReplay: true };
+          throw error;
+        }
+      }
+    }
+    if (request.toolOutputCallIds.length > 0) {
+      try {
+        const session = this.deps.sessions.resolveByToolCallIds(request.toolOutputCallIds);
+        if (threadId) this.deps.sessions.assertThreadAssociation(session, threadId);
+        return { session, canonicalReplay: false };
+      } catch (error) {
+        if (!threadId) throw error;
+        const session = this.deps.sessions.resolve();
+        this.deps.sessions.associateThread(session, threadId);
+        if (this.adoptHistoricalToolReplay(session, request)) return { session, canonicalReplay: true };
+        throw error;
+      }
     }
     const replay = this.deps.sessions.resolveByCanonicalReplay(
       request.entries.flatMap((entry) => entry.role === "tool"
@@ -564,6 +655,69 @@ export class BridgeService {
     return { session, canonicalReplay: false };
   }
 
+  private adoptHistoricalToolReplay(session: Session, request: NormalizedCodexRequest): boolean {
+    if (!request.foreground
+      || request.requestClassification !== "foreground"
+      || session.pendingToolCalls.size > 0
+      || session.completedToolCalls.size > 0
+      || session.transcript.length > 0) return false;
+    const outputs = request.entries.filter((entry) => entry.role === "tool" && entry.callId);
+    if (outputs.length === 0 || outputs.length !== request.toolOutputCallIds.length) return false;
+    const lastOutputIndex = Math.max(...outputs.map((entry) => entry.inputIndex));
+    const currentUser = [...request.entries].reverse().find((entry) =>
+      entry.role === "user" && entry.inputIndex > lastOutputIndex && entry.text.trim().length > 0,
+    );
+    if (!currentUser) return false;
+
+    const calls = new Map<string, typeof request.historicalToolCalls[number]>();
+    for (const call of request.historicalToolCalls) {
+      if (calls.has(call.callId)) return false;
+      calls.set(call.callId, call);
+    }
+    for (const output of outputs) {
+      const call = calls.get(output.callId!);
+      if (!call || call.inputIndex >= output.inputIndex || output.inputIndex >= currentUser.inputIndex) return false;
+    }
+
+    const replayItems = [
+      ...request.entries
+        .filter((entry) => entry.inputIndex < currentUser.inputIndex)
+        .map((entry) => ({ inputIndex: entry.inputIndex, kind: "entry" as const, entry })),
+      ...request.historicalToolCalls
+        .filter((call) => call.inputIndex < currentUser.inputIndex && outputs.some((entry) => entry.callId === call.callId))
+        .map((call) => ({ inputIndex: call.inputIndex, kind: "call" as const, call })),
+    ].sort((left, right) => left.inputIndex - right.inputIndex);
+
+    for (const item of replayItems) {
+      if (item.kind === "call") {
+        session.nativeHistory.push(nativeFunctionCall(item.call.callId, item.call.name, item.call.argumentsJson));
+        continue;
+      }
+      const entry = item.entry;
+      if (entry.role === "tool") {
+        const call = calls.get(entry.callId!);
+        if (!call) return false;
+        const text = truncateToolOutput(entry.text, this.deps.config.toolOutputMaxChars);
+        session.transcript.push({ role: "tool", text, toolName: call.name, callId: entry.callId! });
+        session.nativeHistory.push(nativeFunctionCallOutput(entry.callId!, text));
+        this.deps.sessions.adoptHistoricalToolCall(session, {
+          callId: entry.callId!,
+          toolName: call.name,
+          output: entry.text,
+        });
+        continue;
+      }
+      session.transcript.push({ role: entry.role, text: entry.text });
+      session.nativeHistory.push(nativeMessage(entry.role, entry.text, entry.nativeContent));
+    }
+    this.deps.logger.log({
+      event: "TOOL_HISTORY_ADOPTED",
+      level: "info",
+      data: { completedToolCalls: outputs.length },
+    });
+    return true;
+  }
+
   private adoptCompactedContext(session: Session, request: NormalizedCodexRequest): boolean {
     const pending = session.pendingCompaction;
     if (!pending || request.requestKind === "compaction") return false;
@@ -574,14 +728,14 @@ export class BridgeService {
     if (!transitioned) return false;
     if (request.entries.some((entry) => entry.role === "tool")) return false;
     const canonicalEntries = request.entries.filter(
-      (entry): entry is typeof entry & { role: "user" | "assistant" } => entry.role !== "tool",
+      (entry): entry is typeof entry & { role: "developer" | "user" | "assistant" } => entry.role !== "tool",
     );
     if (canonicalEntries.length === 0) return false;
 
     const transcript = canonicalEntries.map((entry) => ({ role: entry.role, text: entry.text }));
     const nativeHistory = [
       ...(request.instructions ? [nativeMessage("developer", request.instructions)] : []),
-      ...canonicalEntries.map((entry) => nativeMessage(entry.role, entry.text)),
+      ...canonicalEntries.map((entry) => nativeMessage(entry.role, entry.text, entry.nativeContent)),
     ];
     const previousItems = session.nativeHistory.length;
     const previousBytes = jsonBytes(session.nativeHistory);
@@ -640,7 +794,7 @@ export class BridgeService {
   ): Set<number> {
     const includesToolOutput = entries.some((entry) => entry.role === "tool");
     const canonical = session.transcript.filter((entry) => entry.role === "tool" || (
-      (entry.role === "user" || entry.role === "assistant")
+      (entry.role === "developer" || entry.role === "user" || entry.role === "assistant")
       && entry.callId === undefined
       && entry.toolName === undefined
     ));
@@ -699,18 +853,22 @@ export class BridgeService {
     toolCount: number,
     request: NormalizedCodexRequest,
     boundary: ContextBoundary,
+    reason: InferenceReason,
     breakdown?: Pick<InferenceMetrics,
       "instructionBytes" | "canonicalHistoryItems" | "canonicalHistoryBytes"
-      | "currentInputItems" | "currentInputBytes" | "toolCatalogBytes" | "acceptedToolOutputBytes">,
-  ): Promise<{ text: string; usage: EvrenUsage }> {
+      | "currentInputItems" | "currentInputBytes" | "toolCatalogBytes" | "acceptedToolOutputBytes"
+      | "sessionMetadataBytes" | "protocolWrapperBytes" | "encodedImageBytes" | "sourceImageBytes">,
+  ): Promise<{ text: string; usage: EvrenUsage; metrics: InferenceMetrics }> {
     this.deps.pricingGuard.assertAllowed();
     this.deps.usage.assertCertain();
+    const serializationStartedAt = performance.now();
     const serialized = JSON.stringify({
       model: this.deps.config.model,
       input: prompt,
       max_output_tokens: this.deps.config.maxOutputTokensPerCall,
       stream: false,
     });
+    const requestSerializationMs = performance.now() - serializationStartedAt;
     const metrics = this.startInference(
       session,
       serialized,
@@ -718,22 +876,64 @@ export class BridgeService {
       toolCount,
       request.requestClassification,
       breakdown ?? textualPayloadBreakdown(request, session, boundary),
+      reason,
+      request.requestKind,
+      requestSerializationMs,
     );
-    const result = await this.deps.client.infer(prompt, this.deps.config.maxOutputTokensPerCall);
-    const usage = await this.accountUsage(session, result.id, result.usage, metrics);
-    return { text: result.text, usage };
+    const providerStartedAt = Date.now();
+    try {
+      const result = await this.deps.client.infer(
+        prompt,
+        this.deps.config.maxOutputTokensPerCall,
+        this.modelRequestContext(request, metrics.requestNumber),
+        { serializedBody: serialized },
+      );
+      metrics.providerReturnedAt = Date.now();
+      this.recordProviderTiming(session, metrics, result.timing, metrics.providerReturnedAt - providerStartedAt);
+      const usage = await this.accountUsage(session, result.id, result.usage, metrics);
+      return { text: result.text, usage, metrics };
+    } catch (error) {
+      this.recordFailedInference(session, metrics, error, Date.now() - providerStartedAt);
+      throw error;
+    }
   }
 
   private async respondAndAccount(
     session: Session,
     request: Parameters<EvrenTransport["respond"]>[0],
+    serializedRequest: string,
     metrics: InferenceMetrics,
+    codexRequest: NormalizedCodexRequest,
   ): Promise<EvrenNativeResult & { usage: EvrenUsage }> {
     this.deps.pricingGuard.assertAllowed();
     this.deps.usage.assertCertain();
-    const result = await this.deps.client.respond(request);
-    const usage = await this.accountUsage(session, result.id, result.usage, metrics);
-    return { ...result, usage };
+    const providerStartedAt = Date.now();
+    try {
+      const result = await this.deps.client.respond(
+        request,
+        this.modelRequestContext(codexRequest, metrics.requestNumber),
+        { serializedBody: serializedRequest },
+      );
+      metrics.providerReturnedAt = Date.now();
+      this.recordProviderTiming(session, metrics, result.timing, metrics.providerReturnedAt - providerStartedAt);
+      const usage = await this.accountUsage(session, result.id, result.usage, metrics);
+      return { ...result, usage };
+    } catch (error) {
+      this.recordFailedInference(session, metrics, error, Date.now() - providerStartedAt);
+      throw error;
+    }
+  }
+
+  private modelRequestContext(request: NormalizedCodexRequest, inferenceNumber: number): EvrenRequestContext {
+    return {
+      bridgeModel: this.deps.config.model,
+      ...(request.model === undefined ? {} : { codexRequestedModel: request.model }),
+      ...(request.turnMetadata.threadId === undefined ? {} : { threadId: request.turnMetadata.threadId }),
+      ...(request.turnMetadata.turnId === undefined ? {} : { turnId: request.turnMetadata.turnId }),
+      ...(request.requestKind === undefined ? {} : { requestKind: request.requestKind }),
+      inferenceNumber,
+      ...(request.abortSignal === undefined ? {} : { signal: request.abortSignal }),
+    };
   }
 
   private async accountUsage(
@@ -759,6 +959,14 @@ export class BridgeService {
       this.deps.usage.markUncertain();
       throw error;
     }
+    metrics.trace.inputTokens = usage.inputTokens;
+    metrics.trace.outputTokens = usage.outputTokens;
+    metrics.trace.totalTokens = usage.totalTokens;
+    if (usage.cachedTokens !== undefined) metrics.trace.cachedTokens = usage.cachedTokens;
+    session.performanceObservability.peakInferenceInputTokens = Math.max(
+      session.performanceObservability.peakInferenceInputTokens,
+      usage.inputTokens,
+    );
     this.deps.logger.log({
       event: "EVREN_USAGE",
       data: {
@@ -777,6 +985,14 @@ export class BridgeService {
         currentInputBytes: metrics.currentInputBytes,
         toolCatalogBytes: metrics.toolCatalogBytes,
         acceptedToolOutputBytes: metrics.acceptedToolOutputBytes,
+        sessionMetadataBytes: metrics.sessionMetadataBytes,
+        protocolWrapperBytes: metrics.protocolWrapperBytes,
+        encodedImageBytes: metrics.encodedImageBytes,
+        sourceImageBytes: metrics.sourceImageBytes,
+        reason: metrics.reason,
+        requestSerializationMs: metrics.requestSerializationMs,
+        providerWaitMs: metrics.trace.providerWaitMs,
+        responseParseMs: metrics.trace.responseParseMs,
         classification: metrics.requestClassification,
       },
     });
@@ -804,10 +1020,22 @@ export class BridgeService {
     toolCount: number,
     requestClassification: RequestClassification,
     breakdown: Omit<InferenceMetrics,
-      "requestNumber" | "payloadChars" | "payloadBytes" | "historyItems" | "toolCount" | "requestClassification">,
+      "requestNumber" | "payloadChars" | "payloadBytes" | "historyItems" | "toolCount" | "requestClassification"
+      | "reason" | "requestKind" | "startedAt" | "requestSerializationMs" | "providerReturnedAt"
+      | "clientResultProcessingMs" | "trace">,
+    reason: InferenceReason,
+    requestKind: string | undefined,
+    requestSerializationMs: number,
   ): InferenceMetrics {
     session.inferenceCount += 1;
+    requestSerializationMs = Math.max(0, Math.round(requestSerializationMs));
     const payloadBytes = Buffer.byteLength(serializedPayload, "utf8");
+    breakdown.protocolWrapperBytes = Math.max(0, payloadBytes
+      - breakdown.instructionBytes
+      - breakdown.sessionMetadataBytes
+      - breakdown.canonicalHistoryBytes
+      - breakdown.currentInputBytes
+      - breakdown.toolCatalogBytes);
     const activeContextBytes = breakdown.instructionBytes
       + breakdown.canonicalHistoryBytes
       + breakdown.currentInputBytes;
@@ -816,11 +1044,42 @@ export class BridgeService {
     session.contextObservability.currentInputBytes += breakdown.currentInputBytes;
     session.contextObservability.toolCatalogBytes += breakdown.toolCatalogBytes;
     session.contextObservability.acceptedToolOutputReplayBytes += breakdown.acceptedToolOutputBytes;
+    session.contextObservability.instructionBytes += breakdown.instructionBytes;
+    session.contextObservability.sessionMetadataBytes += breakdown.sessionMetadataBytes;
+    session.contextObservability.protocolWrapperBytes += breakdown.protocolWrapperBytes;
+    session.contextObservability.encodedImageBytes += breakdown.encodedImageBytes;
+    session.contextObservability.sourceImageBytes += breakdown.sourceImageBytes;
     session.contextObservability.currentActiveContextBytes = activeContextBytes;
     session.contextObservability.peakActiveContextBytes = Math.max(
       session.contextObservability.peakActiveContextBytes,
       activeContextBytes,
     );
+    session.contextObservability.peakPayloadBytes = Math.max(
+      session.contextObservability.peakPayloadBytes,
+      payloadBytes,
+    );
+    session.performanceObservability.requestSerializationMs += requestSerializationMs;
+    session.performanceObservability.reasonCounts[reason] += 1;
+    const trace: InferenceTraceSummary = {
+      inferenceNumber: session.inferenceCount,
+      reason,
+      requestClassification,
+      ...(requestKind === undefined ? {} : { requestKind }),
+      startedAt: Date.now(),
+      payloadBytes,
+      instructionBytes: breakdown.instructionBytes,
+      canonicalHistoryBytes: breakdown.canonicalHistoryBytes,
+      currentInputBytes: breakdown.currentInputBytes,
+      toolCatalogBytes: breakdown.toolCatalogBytes,
+      acceptedToolOutputBytes: breakdown.acceptedToolOutputBytes,
+      sessionMetadataBytes: breakdown.sessionMetadataBytes,
+      protocolWrapperBytes: breakdown.protocolWrapperBytes,
+      encodedImageBytes: breakdown.encodedImageBytes,
+      sourceImageBytes: breakdown.sourceImageBytes,
+      requestSerializationMs,
+    };
+    session.performanceObservability.traces.push(trace);
+    session.performanceObservability.traces = session.performanceObservability.traces.slice(-128);
     return {
       requestNumber: session.inferenceCount,
       payloadChars: serializedPayload.length,
@@ -828,8 +1087,53 @@ export class BridgeService {
       historyItems,
       toolCount,
       requestClassification,
+      reason,
+      ...(requestKind === undefined ? {} : { requestKind }),
+      startedAt: trace.startedAt,
+      requestSerializationMs,
+      clientResultProcessingMs: 0,
+      trace,
       ...breakdown,
     };
+  }
+
+  private recordProviderTiming(
+    session: Session,
+    metrics: InferenceMetrics,
+    timing: EvrenResponseTiming | undefined,
+    fallbackElapsedMs: number,
+  ): void {
+    const providerWaitMs = timing?.providerWaitMs ?? fallbackElapsedMs;
+    const responseParseMs = timing?.responseParseMs ?? 0;
+    metrics.clientResultProcessingMs = timing?.resultProcessingMs ?? 0;
+    metrics.trace.providerWaitMs = providerWaitMs;
+    metrics.trace.responseParseMs = responseParseMs;
+    session.performanceObservability.providerWaitMs += providerWaitMs;
+    session.performanceObservability.responseParseMs += responseParseMs;
+  }
+
+  private completeInferenceProcessing(session: Session, metrics: InferenceMetrics, bridgeProcessingMs: number): void {
+    if (metrics.trace.totalElapsedMs !== undefined) return;
+    const bridgeAfterProviderMs = metrics.providerReturnedAt === undefined
+      ? bridgeProcessingMs
+      : Date.now() - metrics.providerReturnedAt;
+    const resultProcessingMs = metrics.clientResultProcessingMs + Math.max(0, bridgeAfterProviderMs);
+    metrics.trace.resultProcessingMs = resultProcessingMs;
+    metrics.trace.totalElapsedMs = Math.max(0, Date.now() - metrics.startedAt);
+    session.performanceObservability.resultProcessingMs += resultProcessingMs;
+  }
+
+  private recordFailedInference(
+    session: Session,
+    metrics: InferenceMetrics,
+    error: unknown,
+    providerElapsedMs: number,
+  ): void {
+    if (metrics.trace.providerWaitMs === undefined) {
+      this.recordProviderTiming(session, metrics, undefined, providerElapsedMs);
+    }
+    metrics.trace.failureCode = safeFailureCode(error);
+    this.completeInferenceProcessing(session, metrics, 0);
   }
 
   private assertPollContinuationAllowed(session: Session, classification: IncomingClassification): void {
@@ -852,6 +1156,39 @@ export class BridgeService {
       },
     });
     throw new ToolPollLimitError(sequence.consecutivePolls, limit);
+  }
+
+  private recordNoProgressResult(session: Session, classification: IncomingClassification): void {
+    if (classification.prepared.active.length !== 1) {
+      delete session.noProgress;
+      return;
+    }
+    const active = classification.prepared.active[0]!;
+    if (!active.firstReceipt || !active.pending.toolCallFingerprint) return;
+    const fingerprint = fingerprintToolResult(active.pending.toolCallFingerprint, active.output);
+    const previous = session.noProgress;
+    session.noProgress = previous?.fingerprint === fingerprint
+      ? {
+        fingerprint,
+        consecutiveResults: previous.consecutiveResults + 1,
+      }
+      : { fingerprint, consecutiveResults: 1 };
+  }
+
+  private assertNoProgressContinuationAllowed(session: Session, classification: IncomingClassification): void {
+    const limit = this.deps.config.maxConsecutiveNoProgressInferences;
+    if (limit === 0 || classification.prepared.active.length !== 1) return;
+    const active = classification.prepared.active[0]!;
+    if (!active.pending.toolCallFingerprint || !session.noProgress) return;
+    const fingerprint = fingerprintToolResult(active.pending.toolCallFingerprint, active.output);
+    if (session.noProgress.fingerprint !== fingerprint || session.noProgress.consecutiveResults < limit) return;
+    this.deps.logger.log({
+      event: "NO_PROGRESS_LOOP",
+      level: "error",
+      message: "Deterministic no-progress loop blocked before another EVREN inference.",
+      data: { consecutiveResults: session.noProgress.consecutiveResults },
+    });
+    throw new NoProgressLoopError(session.noProgress.consecutiveResults, limit);
   }
 
   private recordPollDecision(
@@ -968,12 +1305,17 @@ function addOptionalUsage(left: number | undefined, right: number | undefined): 
 function nativePayloadBreakdown(
   request: NativeEvrenRequest,
   historyBoundary: number,
+  _serializedRequest: string,
 ): Pick<InferenceMetrics,
   "instructionBytes" | "canonicalHistoryItems" | "canonicalHistoryBytes"
-  | "currentInputItems" | "currentInputBytes" | "toolCatalogBytes" | "acceptedToolOutputBytes"> {
-  const instructions = request.input.filter(isDeveloperMessage);
-  const canonicalHistory = request.input.slice(0, historyBoundary).filter((item) => !isDeveloperMessage(item));
-  const currentInput = request.input.slice(historyBoundary).filter((item) => !isDeveloperMessage(item));
+  | "currentInputItems" | "currentInputBytes" | "toolCatalogBytes" | "acceptedToolOutputBytes"
+  | "sessionMetadataBytes" | "protocolWrapperBytes" | "encodedImageBytes" | "sourceImageBytes"> {
+  const identity = request.input.filter(isVerifiedModelIdentityMessage);
+  const inputWithoutIdentity = request.input.filter((item) => !isVerifiedModelIdentityMessage(item));
+  const instructions = inputWithoutIdentity.filter(isDeveloperMessage);
+  const canonicalHistory = inputWithoutIdentity.slice(0, historyBoundary).filter((item) => !isDeveloperMessage(item));
+  const currentInput = inputWithoutIdentity.slice(historyBoundary).filter((item) => !isDeveloperMessage(item));
+  const images = imagePayloadSizes(request.input);
   return {
     instructionBytes: jsonBytes(instructions),
     canonicalHistoryItems: canonicalHistory.length,
@@ -982,6 +1324,10 @@ function nativePayloadBreakdown(
     currentInputBytes: jsonBytes(currentInput),
     toolCatalogBytes: jsonBytes(request.tools),
     acceptedToolOutputBytes: jsonBytes(canonicalHistory.filter((item) => item.type === "function_call_output")),
+    sessionMetadataBytes: jsonBytes(identity),
+    protocolWrapperBytes: 0,
+    encodedImageBytes: images.encodedBytes,
+    sourceImageBytes: images.sourceBytes,
   };
 }
 
@@ -991,7 +1337,8 @@ function textualPayloadBreakdown(
   boundary: ContextBoundary,
 ): Pick<InferenceMetrics,
   "instructionBytes" | "canonicalHistoryItems" | "canonicalHistoryBytes"
-  | "currentInputItems" | "currentInputBytes" | "toolCatalogBytes" | "acceptedToolOutputBytes"> {
+  | "currentInputItems" | "currentInputBytes" | "toolCatalogBytes" | "acceptedToolOutputBytes"
+  | "sessionMetadataBytes" | "protocolWrapperBytes" | "encodedImageBytes" | "sourceImageBytes"> {
   const canonicalHistory = session.transcript.slice(0, boundary.transcriptItems);
   const currentInput = session.transcript.slice(boundary.transcriptItems);
   return {
@@ -1002,12 +1349,17 @@ function textualPayloadBreakdown(
     currentInputBytes: jsonBytes(currentInput),
     toolCatalogBytes: jsonBytes(request.tools),
     acceptedToolOutputBytes: jsonBytes(canonicalHistory.filter((entry) => entry.role === "tool")),
+    sessionMetadataBytes: 0,
+    protocolWrapperBytes: 0,
+    encodedImageBytes: 0,
+    sourceImageBytes: 0,
   };
 }
 
 function opaqueCurrentInputBreakdown(prompt: string): Pick<InferenceMetrics,
   "instructionBytes" | "canonicalHistoryItems" | "canonicalHistoryBytes"
-  | "currentInputItems" | "currentInputBytes" | "toolCatalogBytes" | "acceptedToolOutputBytes"> {
+  | "currentInputItems" | "currentInputBytes" | "toolCatalogBytes" | "acceptedToolOutputBytes"
+  | "sessionMetadataBytes" | "protocolWrapperBytes" | "encodedImageBytes" | "sourceImageBytes"> {
   return {
     instructionBytes: 0,
     canonicalHistoryItems: 0,
@@ -1016,11 +1368,68 @@ function opaqueCurrentInputBreakdown(prompt: string): Pick<InferenceMetrics,
     currentInputBytes: Buffer.byteLength(prompt, "utf8"),
     toolCatalogBytes: 0,
     acceptedToolOutputBytes: 0,
+    sessionMetadataBytes: 0,
+    protocolWrapperBytes: 0,
+    encodedImageBytes: 0,
+    sourceImageBytes: 0,
   };
 }
 
 function isDeveloperMessage(item: Record<string, unknown>): boolean {
   return item.type === "message" && item.role === "developer";
+}
+
+function isVerifiedModelIdentityMessage(item: Record<string, unknown>): boolean {
+  return isDeveloperMessage(item)
+    && Array.isArray(item.content)
+    && item.content.some((block) => Boolean(block) && typeof block === "object"
+      && typeof (block as { text?: unknown }).text === "string"
+      && (block as { text: string }).text.includes("BRIDGE-VERIFIED LIVE SESSION MODEL METADATA"));
+}
+
+function imagePayloadSizes(items: readonly Record<string, unknown>[]): { encodedBytes: number; sourceBytes: number } {
+  let encodedBytes = 0;
+  let sourceBytes = 0;
+  for (const item of items) {
+    if (!Array.isArray(item.content)) continue;
+    for (const block of item.content) {
+      if (!block || typeof block !== "object" || (block as { type?: unknown }).type !== "input_image") continue;
+      encodedBytes += jsonBytes(block);
+      const imageUrl = (block as { image_url?: unknown }).image_url;
+      if (typeof imageUrl === "string") sourceBytes += decodedDataUrlBytes(imageUrl);
+    }
+  }
+  return { encodedBytes, sourceBytes };
+}
+
+function decodedDataUrlBytes(value: string): number {
+  const match = /^data:[^,]*;base64,([A-Za-z0-9+/]*={0,2})$/.exec(value);
+  if (!match) return 0;
+  const encoded = match[1]!;
+  const padding = encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor(encoded.length * 3 / 4) - padding);
+}
+
+function classifyInferenceReason(
+  request: NormalizedCodexRequest,
+  classification: IncomingClassification,
+): InferenceReason {
+  if (request.requestKind === "compaction") return "compaction";
+  if (request.requestKind === "prewarm") return "prewarm";
+  if (request.requestKind === "memory") return "memory";
+  if (classification.continuation === "tool_output") return "tool_result";
+  if (classification.continuation === "compaction_adoption") return "compaction_continuation";
+  if (classification.continuation === "new_request" && request.requestClassification !== "internal") return "initial_turn";
+  if (classification.continuation === "previous_response"
+    || classification.continuation === "historical_replay"
+    || classification.continuation === "canonical_replay") return "conversation_continuation";
+  return "other";
+}
+
+function safeFailureCode(error: unknown): string {
+  if (!error || typeof error !== "object") return "unknown_error";
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && /^[a-z0-9_]{1,80}$/i.test(code) ? code : "inference_failed";
 }
 
 function jsonBytes(value: unknown): number {

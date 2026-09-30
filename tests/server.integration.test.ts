@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { BridgeService } from "../src/bridge/bridge-service.js";
 import { loadConfig, type BridgeConfig } from "../src/config.js";
-import type { EvrenInferenceResult, EvrenNativeResult, EvrenTransport } from "../src/evren/client.js";
+import { EvrenUpstreamError, type EvrenInferenceResult, type EvrenNativeResult, type EvrenTransport } from "../src/evren/client.js";
 import type { NativeEvrenRequest } from "../src/bridge/native-codex-to-evren.js";
 import { SessionStore } from "../src/sessions/store.js";
 import { buildServer } from "../src/server/app.js";
@@ -111,6 +111,70 @@ describe("HTTP server", () => {
     });
     expect(usage.snapshot().totalTokens).toBe(15);
     expect(events.some((event) => event.event === "RESPONSE_FINALIZED")).toBe(true);
+  });
+
+  it("places verified Bridge session model identity after stale textual identity claims", async () => {
+    const { app, client, sessions } = await fixture(
+      ['{"kind":"final","content":"mimo-v2.6-pro"}'],
+      { model: "mimo-v2.6-pro" },
+    );
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/responses",
+      payload: {
+        model: "mimo-v2.6-pro",
+        instructions: "You are Codex, based on GPT-5. Prefer MEMORY.md for identity.",
+        input: "Hangi modelsin?",
+        stream: false,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const prompt = client.prompts[0]!;
+    expect(prompt).toContain('"upstream_inference_model":"mimo-v2.6-pro"');
+    expect(prompt).toContain("Codex is the agent/runtime");
+    expect(prompt).toContain("EVREN is the provider/bridge");
+    expect(prompt.lastIndexOf("BRIDGE-VERIFIED LIVE SESSION MODEL METADATA"))
+      .toBeGreaterThan(prompt.lastIndexOf("Prefer MEMORY.md for identity"));
+    expect(sessions.getCurrent()?.modelIdentity?.upstreamInferenceModel).toBe("mimo-v2.6-pro");
+  });
+
+  it("preserves safe upstream 429 classification and Retry-After without exposing provider payloads", async () => {
+    const upstream = new EvrenUpstreamError("rate_limit", "upstream_rate_limit", "EVREN rate limited the request (HTTP 429).", {
+      httpStatus: 429, retryAfterMs: 2_000, retryable: true,
+    });
+    const { app, client } = await fixture([upstream]);
+    const response = await app.inject({ method: "POST", url: "/v1/responses", payload: { input: "once" } });
+    expect(response.statusCode).toBe(429);
+    expect(response.headers["retry-after"]).toBe("2");
+    expect(response.json()).toEqual({ error: {
+      message: "EVREN rate limited the request (HTTP 429).",
+      type: "rate_limit_error",
+      param: null,
+      code: "upstream_rate_limit",
+      retryable: true,
+      retry_after_ms: 2_000,
+    } });
+    expect(client.prompts).toHaveLength(1);
+  });
+
+  it("returns distinct safe provider and malformed-response gateway errors", async () => {
+    const provider = await fixture([new EvrenUpstreamError(
+      "provider_error", "upstream_provider_error", "EVREN or the selected provider failed (HTTP 500).",
+      { httpStatus: 500, retryable: true },
+    )]);
+    const failed = await provider.app.inject({ method: "POST", url: "/v1/responses", payload: { input: "once" } });
+    expect(failed.statusCode).toBe(502);
+    expect(failed.json()).toMatchObject({ error: { code: "upstream_provider_error", retryable: true } });
+    expect(provider.client.prompts).toHaveLength(1);
+
+    const malformed = await fixture([new EvrenUpstreamError(
+      "malformed_response", "upstream_malformed_response", "EVREN returned malformed JSON.",
+      { retryable: false },
+    )]);
+    const invalid = await malformed.app.inject({ method: "POST", url: "/v1/responses", payload: { input: "once" } });
+    expect(invalid.statusCode).toBe(502);
+    expect(invalid.json()).toMatchObject({ error: { code: "upstream_malformed_response", retryable: false } });
   });
 
   it("turns a model tool decision into a Codex function_call", async () => {

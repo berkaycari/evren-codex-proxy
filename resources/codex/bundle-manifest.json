@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "codexVersion": "0.157.1",
+  "upstreamTag": "rust-v0.157.1",
+  "platform": "win32",
+  "arch": "x64",
+  "target": "x86_64-pc-windows-msvc",
+  "source": "https://github.com/openai/codex/releases/tag/rust-v0.157.1",
+  "files": [
+    { "path": "codex-package.json", "sizeBytes": 215, "sha256": "5cd500ed18077bde9792ed37b65cee842d4319782f323edb197bdd235bf69289" },
+    { "path": "bin/codex-code-mode-host.exe", "sizeBytes": 74631472, "sha256": "5583872360541856fe6207eba0fb8486d9967083fbf4d40e2126ec9bb9c06ead" },
+    { "path": "bin/codex.exe", "sizeBytes": 322515248, "sha256": "8cb0e69e99ff2a158c54815db82d0f2e524d8f301bc30184722cfd1ae5973574" },
+    { "path": "codex-path/rg.exe", "sizeBytes": 4218880, "sha256": "14231169855ec5205cf5a1b6f1db358ff4aed4247c86b69ce8aae647c77f6680" },
+    { "path": "codex-resources/codex-command-runner.exe", "sizeBytes": 8200496, "sha256": "3834fec990e505577888605f11b3c9820d1384784b8709861ac7e61122aa2c1c" },
+    { "path": "codex-resources/codex-windows-sandbox-setup.exe", "sizeBytes": 17670960, "sha256": "c6a5ec12dee7f9563c5d0f2f6e8b82a0528e5cedd4d330dbda091dbb91d58b78" }
+  ]
+}

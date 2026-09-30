@@ -87,6 +87,21 @@ export function registerHealthRoute(
               : session.contextObservability.canonicalHistoryReplayBytes
                 / session.contextObservability.totalUpstreamPayloadBytes,
           },
+          performance: {
+            provider_wait_ms: session.performanceObservability.providerWaitMs,
+            response_parse_ms: session.performanceObservability.responseParseMs,
+            result_processing_ms: session.performanceObservability.resultProcessingMs,
+            request_serialization_ms: session.performanceObservability.requestSerializationMs,
+            peak_payload_bytes: session.contextObservability.peakPayloadBytes,
+            instruction_bytes: session.contextObservability.instructionBytes,
+            session_metadata_bytes: session.contextObservability.sessionMetadataBytes,
+            protocol_wrapper_bytes: session.contextObservability.protocolWrapperBytes,
+            encoded_image_bytes: session.contextObservability.encodedImageBytes,
+            source_image_bytes: session.contextObservability.sourceImageBytes,
+            peak_inference_input_tokens: session.performanceObservability.peakInferenceInputTokens,
+            inference_reasons: session.performanceObservability.reasonCounts,
+            inference_trace: session.performanceObservability.traces.map((trace) => ({ ...trace })),
+          },
           limit_recovery: session.limitRecovery ? {
             limit_name: session.limitRecovery.limitName,
             current: session.limitRecovery.current,

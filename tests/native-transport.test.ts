@@ -13,7 +13,7 @@ import { parseNativeEvrenResponse } from "../src/bridge/native-evren-to-codex.js
 import { normalizeCodexRequest } from "../src/bridge/normalize-codex-request.js";
 import { normalizeTools, ToolProtocolError } from "../src/bridge/tool-protocol.js";
 import { loadConfig, type BridgeConfig } from "../src/config.js";
-import type { EvrenInferenceResult, EvrenNativeResult, EvrenTransport } from "../src/evren/client.js";
+import type { EvrenInferenceResult, EvrenNativeResult, EvrenTransport, PreparedEvrenPayload } from "../src/evren/client.js";
 import { DeterministicRetryCircuit } from "../src/safety/deterministic-retry-circuit.js";
 import { SessionStore } from "../src/sessions/store.js";
 import { buildServer } from "../src/server/app.js";
@@ -34,6 +34,17 @@ const customTool = {
   name: "shell",
   description: "Run a shell command",
 };
+
+const verifiedModelIdentity = {
+  source: "bridge_session",
+  agentRuntime: "Codex",
+  providerBridge: "EVREN",
+  upstreamInferenceModel: "deepseek-v4.1-flash",
+} as const;
+
+function withoutVerifiedModelIdentity(input: readonly Record<string, unknown>[] | undefined): Record<string, unknown>[] {
+  return (input ?? []).filter((item) => !JSON.stringify(item).includes("BRIDGE-VERIFIED LIVE SESSION MODEL METADATA"));
+}
 
 function nativeResponse(
   output: unknown[],
@@ -78,14 +89,16 @@ function codexWindowMetadata(
 
 class NativeMock implements EvrenTransport {
   readonly requests: NativeEvrenRequest[] = [];
+  readonly preparedPayloads: Array<PreparedEvrenPayload | undefined> = [];
   private index = 0;
   constructor(private readonly results: Array<Record<string, unknown> | Error>) {}
   async getModels(): Promise<unknown> { return { data: [] }; }
   async infer(_input: string, _maxOutputTokens: number): Promise<EvrenInferenceResult> {
     throw new Error("Textual inference must not run in native mode.");
   }
-  async respond(request: NativeEvrenRequest): Promise<EvrenNativeResult> {
+  async respond(request: NativeEvrenRequest, _context?: unknown, prepared?: PreparedEvrenPayload): Promise<EvrenNativeResult> {
     this.requests.push(structuredClone(request));
+    this.preparedPayloads.push(prepared);
     const candidate = this.results[this.index++] ?? this.results.at(-1);
     if (candidate instanceof Error) throw candidate;
     if (!candidate) throw new Error("No mock EVREN response configured.");
@@ -170,7 +183,7 @@ describe("native Codex to EVREN mapping", () => {
 
   it("maps mixed catalogs entirely to function tools", () => {
     const request = normalizeCodexRequest({ input: "test", tools: [functionTool, customTool] });
-    const native = buildNativeEvrenRequest(request, [], "deepseek-v4.1-flash", 4096);
+    const native = buildNativeEvrenRequest(request, [], "deepseek-v4.1-flash", 4096, verifiedModelIdentity);
     expect(native.tools.map((tool) => [tool.name, tool.type])).toEqual([
       ["get_current_directory", "function"],
       ["shell", "function"],
@@ -199,7 +212,7 @@ describe("native Codex to EVREN mapping", () => {
       metadata: { secret: true },
       reasoning: { effort: "high" },
     });
-    const native = buildNativeEvrenRequest(request, [], "deepseek-v4.1-flash", 4096);
+    const native = buildNativeEvrenRequest(request, [], "deepseek-v4.1-flash", 4096, verifiedModelIdentity);
     expect(Object.keys(native).sort()).toEqual([
       "input", "max_output_tokens", "model", "parallel_tool_calls", "stream", "tool_choice", "tools",
     ]);
@@ -219,6 +232,7 @@ describe("native Codex to EVREN mapping", () => {
       [],
       "deepseek-v4.1-flash",
       4096,
+      verifiedModelIdentity,
     );
     expect(build("none").tools).toEqual([]);
     expect(build({ type: "custom", name: "shell" }).tools.map((tool) => tool.name)).toEqual(["shell"]);
@@ -348,7 +362,7 @@ describe("native bridge lifecycle", () => {
     });
     expect(second.statusCode).toBe(200);
     expect(client.requests[1]).not.toHaveProperty("previous_response_id");
-    expect(client.requests[1]?.input).toEqual([
+    expect(withoutVerifiedModelIdentity(client.requests[1]?.input)).toEqual([
       expect.objectContaining({ type: "message", role: "user" }),
       { type: "function_call", call_id: "call_cwd", name: "get_current_directory", arguments: "{}" },
       { type: "function_call_output", call_id: "call_cwd", output: "C:\\work" },
@@ -708,8 +722,15 @@ describe("native bridge lifecycle", () => {
     expect(session.acceptedCompactionCount).toBe(1);
     expect(session.usage.totalTokens).toBe(245);
     expect(JSON.stringify(client.requests[2])).not.toContain("obsolete-");
-    expect(client.requests[2]?.input.filter((item) => item.role === "developer")).toHaveLength(1);
+    expect(withoutVerifiedModelIdentity(client.requests[2]?.input).filter((item) => item.role === "developer")).toHaveLength(1);
     expect(session.contextObservability.peakActiveContextBytes).toBeGreaterThan(session.contextObservability.currentActiveContextBytes);
+    expect(session.performanceObservability.reasonCounts).toMatchObject({
+      initial_turn: 1,
+      compaction: 1,
+      compaction_continuation: 1,
+    });
+    expect(session.performanceObservability.traces[2]!.canonicalHistoryBytes)
+      .toBeLessThan(session.performanceObservability.traces[1]!.canonicalHistoryBytes);
 
     const completed = await app.inject({ method: "POST", url: "/v1/responses", payload: {
       input: [{ type: "function_call_output", call_id: "call_after_compaction", output: "C:\\repo" }],
@@ -816,8 +837,8 @@ describe("native bridge lifecycle", () => {
     expect(sessions.getByResponseId(continued.json().id)).toBe(session);
     expect(session).toMatchObject({ requestCount: 4, inferenceCount: 4, toolCallCount: 2 });
     expect(client.requests.map((request) => request.tools.length)).toEqual([1, 1, 1, 1]);
-    expect(client.requests.map((request) => request.input.length)).toEqual([1, 3, 5, 7]);
-    expect(client.requests[3]?.input.map((item) => [item.type, item.call_id ?? item.role])).toEqual([
+    expect(client.requests.map((request) => withoutVerifiedModelIdentity(request.input).length)).toEqual([1, 3, 5, 7]);
+    expect(withoutVerifiedModelIdentity(client.requests[3]?.input).map((item) => [item.type, item.call_id ?? item.role])).toEqual([
       ["message", "user"],
       ["function_call", "call_cost_1"],
       ["function_call_output", "call_cost_1"],
@@ -834,10 +855,11 @@ describe("native bridge lifecycle", () => {
     const usageEvents = events.filter((event) => event.event === "EVREN_USAGE");
     expect(usageEvents).toHaveLength(4);
     expect(usageEvents.map((event) => event.data?.request)).toEqual([1, 2, 3, 4]);
-    expect(usageEvents.map((event) => event.data?.historyItems)).toEqual([1, 3, 5, 7]);
+    expect(usageEvents.map((event) => event.data?.historyItems)).toEqual([2, 4, 6, 8]);
     expect(usageEvents.map((event) => event.data?.toolCount)).toEqual([1, 1, 1, 1]);
     for (const [index, event] of usageEvents.entries()) {
       const serialized = JSON.stringify(client.requests[index]);
+      expect(client.preparedPayloads[index]?.serializedBody).toBe(serialized);
       expect(event.data).toMatchObject({
         inputTokens: 10,
         outputTokens: 5,
@@ -846,6 +868,13 @@ describe("native bridge lifecycle", () => {
         payloadBytes: Buffer.byteLength(serialized, "utf8"),
       });
     }
+    expect(session?.performanceObservability.reasonCounts).toMatchObject({ initial_turn: 1, tool_result: 2, conversation_continuation: 1 });
+    expect(session?.performanceObservability.traces.map((trace) => trace.reason)).toEqual([
+      "initial_turn", "tool_result", "tool_result", "conversation_continuation",
+    ]);
+    expect(session?.performanceObservability.traces.every((trace) => trace.totalElapsedMs !== undefined)).toBe(true);
+    expect(session?.contextObservability.peakPayloadBytes).toBe(Math.max(...client.requests.map((request) => Buffer.byteLength(JSON.stringify(request), "utf8"))));
+    expect(session?.contextObservability.protocolWrapperBytes).toBeGreaterThan(0);
   });
 
   it("treats completed tool output replay plus a new user message as a new turn", async () => {
@@ -926,6 +955,71 @@ describe("native bridge lifecycle", () => {
     expect(newTurnInput.match(/original output/g)).toHaveLength(1);
     expect(newTurnInput.match(/history done/g)).toHaveLength(1);
     expect(newTurnInput.match(/new question/g)).toHaveLength(1);
+  });
+
+  it("adopts canonical tool history after restart and preserves a new image turn", async () => {
+    const imageUrl = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB";
+    const { app, client, sessions, events } = await fixture([
+      nativeResponse([{ type: "message", role: "assistant", content: [{ type: "output_text", text: "image accepted" }] }]),
+    ]);
+
+    const resumed = await app.inject({
+      method: "POST",
+      url: "/v1/responses",
+      payload: {
+        tools: [functionTool],
+        input: [
+          { type: "message", role: "user", content: "show cwd" },
+          { type: "function_call", call_id: "call_before_restart", name: "get_current_directory", arguments: "{}" },
+          { type: "function_call_output", call_id: "call_before_restart", output: "C:\\work" },
+          { type: "message", role: "assistant", content: "C:\\work confirmed" },
+          {
+            type: "message",
+            role: "user",
+            content: [
+              { type: "input_text", text: "inspect this image" },
+              { type: "input_image", image_url: imageUrl, detail: "auto" },
+            ],
+          },
+        ],
+        client_metadata: codexMetadata("turn", "thread_resumed_image"),
+      },
+    });
+
+    expect(resumed.statusCode).toBe(200);
+    expect(client.requests).toHaveLength(1);
+    const sent = JSON.stringify(client.requests[0]?.input);
+    expect(sent.split("show cwd").length - 1).toBe(1);
+    expect(sent.split("call_before_restart").length - 1).toBe(2);
+    expect(sent.split("C:\\\\work confirmed").length - 1).toBe(1);
+    expect(sent.split("inspect this image").length - 1).toBe(1);
+    expect(sent.split(imageUrl).length - 1).toBe(1);
+    expect(sent).not.toContain("input_image omitted");
+    const session = sessions.getByResponseId(resumed.json().id);
+    expect([...session?.completedToolCalls.keys() ?? []]).toEqual(["call_before_restart"]);
+    expect(session?.contextObservability.encodedImageBytes).toBeGreaterThan(imageUrl.length);
+    expect(session?.contextObservability.sourceImageBytes).toBeGreaterThan(0);
+    expect(session?.performanceObservability.traces[0]).toMatchObject({ encodedImageBytes: expect.any(Number), sourceImageBytes: expect.any(Number) });
+    expect(events.filter((event) => event.event === "TOOL_HISTORY_ADOPTED")).toHaveLength(1);
+  });
+
+  it("rejects an unpaired historical tool output after restart", async () => {
+    const { app, client } = await fixture([
+      nativeResponse([{ type: "message", role: "assistant", content: [{ type: "output_text", text: "must not run" }] }]),
+    ]);
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/responses",
+      payload: {
+        input: [
+          { type: "function_call_output", call_id: "call_missing", output: "unknown" },
+          { type: "message", role: "user", content: "continue" },
+        ],
+        client_metadata: codexMetadata("turn", "thread_unpaired_history"),
+      },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(client.requests).toHaveLength(0);
   });
 
   it("rejects changed completed replay and historical-only replay without EVREN calls", async () => {
@@ -1066,7 +1160,7 @@ describe("native bridge lifecycle", () => {
     expect(continued.statusCode).toBe(200);
     expect(continued.json().output[0].content[0].text).toBe("after first");
     expect(client.requests).toHaveLength(2);
-    expect(client.requests[1]?.input).toEqual([
+    expect(withoutVerifiedModelIdentity(client.requests[1]?.input)).toEqual([
       { type: "message", role: "user", content: [{ type: "input_text", text: "test" }] },
       { type: "function_call", call_id: "call_1", name: "get_current_directory", arguments: "{}" },
       { type: "function_call_output", call_id: "call_1", output: "C:\\work" },
@@ -1265,6 +1359,62 @@ describe("native bridge lifecycle", () => {
 
     expect(blocked.json().error.code).toBe("retry_circuit_blocked");
     expect(client.requests).toHaveLength(4);
+  });
+
+  it("blocks repeated identical tool results before another inference", async () => {
+    const repeatedCommand = (callId: string) => nativeResponse([
+      { type: "function_call", call_id: callId, name: "get_current_directory", arguments: "{}" },
+    ]);
+    const { app, client } = await fixture([
+      repeatedCommand("call_progress_1"),
+      repeatedCommand("call_progress_2"),
+      repeatedCommand("call_progress_3"),
+      nativeResponse([{ type: "message", role: "assistant", content: [{ type: "output_text", text: "must not infer" }] }]),
+    ], { maxConsecutiveNoProgressInferences: 2 });
+
+    const first = await app.inject({
+      method: "POST", url: "/v1/responses", payload: { input: "start", tools: [functionTool] },
+    });
+    const second = await app.inject({
+      method: "POST", url: "/v1/responses",
+      payload: { input: [{ type: "function_call_output", call_id: "call_progress_1", output: "same failure" }] },
+    });
+    const blocked = await app.inject({
+      method: "POST", url: "/v1/responses",
+      payload: { input: [{ type: "function_call_output", call_id: "call_progress_2", output: "same failure" }] },
+    });
+
+    expect(first.statusCode).toBe(200);
+    expect(second.statusCode).toBe(200);
+    expect(blocked.statusCode).toBe(400);
+    expect(blocked.json().error).toMatchObject({ code: "no_progress_loop" });
+    expect(client.requests).toHaveLength(2);
+  });
+
+  it("allows a tool continuation when its output genuinely changes", async () => {
+    const { app, client } = await fixture([
+      nativeResponse([{ type: "function_call", call_id: "call_change_1", name: "get_current_directory", arguments: "{}" }]),
+      nativeResponse([{ type: "function_call", call_id: "call_change_2", name: "get_current_directory", arguments: "{}" }]),
+      nativeResponse([{ type: "message", role: "assistant", content: [{ type: "output_text", text: "completed" }] }]),
+    ], { maxConsecutiveNoProgressInferences: 2 });
+
+    const first = await app.inject({
+      method: "POST", url: "/v1/responses", payload: { input: "start", tools: [functionTool] },
+    });
+    const second = await app.inject({
+      method: "POST", url: "/v1/responses",
+      payload: { input: [{ type: "function_call_output", call_id: "call_change_1", output: "progress one" }] },
+    });
+    const completed = await app.inject({
+      method: "POST", url: "/v1/responses",
+      payload: { input: [{ type: "function_call_output", call_id: "call_change_2", output: "progress two" }] },
+    });
+
+    expect(first.statusCode).toBe(200);
+    expect(second.statusCode).toBe(200);
+    expect(completed.statusCode).toBe(200);
+    expect(completed.json().output[0].content[0].text).toBe("completed");
+    expect(client.requests).toHaveLength(3);
   });
 
   it("does not arm the deterministic circuit for transient EVREN failures", async () => {

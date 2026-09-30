@@ -1,10 +1,24 @@
 # Dependencies and generated output
 node_modules/
 dist/
+dist-desktop/
+dist-release/
 build/
 coverage/
 .cache/
 .turbo/
+
+# Generated release executables and metadata (managed by electron-builder output)
+*.blockmap
+latest.yml
+latest-mac.yml
+latest-linux.yml
+win-unpacked/
+linux-unpacked/
+mac-unpacked/
+EVREN-Codex-*.exe
+EVREN-Codex-*.zip
+EVREN-Codex-*.dmg
 
 # Secrets: keep only the documented placeholder template
 .env
@@ -42,3 +56,15 @@ dumps/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Personal agent notes (keep AGENTS.md tracked)
+AGENTS.local.md
+
+# Internal development phase documents and benchmark runs (preserved in git history only)
+benchmarks/
+docs/v2-*.md
+docs/v2-*.txt
+
+# Bundled Codex runtime binaries are staged locally for packaging.
+# They are distributed inside GitHub Release artifacts, not source Git.
+resources/codex/win32-x64/
